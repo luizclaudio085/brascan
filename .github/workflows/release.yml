@@ -1,0 +1,64 @@
+# Cada push na main vira um APK novo no GitHub Releases.
+# O app consulta releases/latest/download/version.json a cada 30 s e se atualiza sozinho.
+name: APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    env:
+      VERSION_CODE: ${{ github.run_number }}0
+      VERSION_NAME: 1.${{ github.run_number }}
+      UPDATE_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Chave de assinatura
+        env:
+          KEYSTORE_B64: ${{ secrets.BRASCAN_KEYSTORE_B64 }}
+        run: |
+          test -n "$KEYSTORE_B64" || { echo "::error::Falta o secret BRASCAN_KEYSTORE_B64"; exit 1; }
+          echo "$KEYSTORE_B64" | base64 -d > brascan-release.jks
+
+      - name: Compilar APK
+        env:
+          BRASCAN_KEYSTORE: brascan-release.jks
+          BRASCAN_STORE_PASSWORD: ${{ secrets.BRASCAN_STORE_PASSWORD }}
+          BRASCAN_KEY_ALIAS: brascan
+          BRASCAN_KEY_PASSWORD: ${{ secrets.BRASCAN_STORE_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleRelease
+          cp app/build/outputs/apk/release/app-release.apk brascan.apk
+
+      - name: Publicar release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MSG: ${{ github.event.head_commit.message }}
+        run: |
+          NOTES="$(printf '%s' "${MSG:-build manual}" | head -n1 | cut -c1-200)"
+          jq -n --argjson code "$VERSION_CODE" --arg name "$VERSION_NAME" --arg sha "$(sha256sum brascan.apk | cut -d' ' -f1)" \
+            --arg apk "https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION_NAME/brascan.apk" --arg notes "$NOTES" \
+            '{versionCode: $code, versionName: $name, apk: $apk, sha256: $sha, notes: $notes}' > version.json
+          cat version.json
+          gh release create "v$VERSION_NAME" brascan.apk version.json --title "BraScan $VERSION_NAME" --notes "$NOTES" --latest
+          # Mantém só as 15 versões mais recentes.
+          gh release list --limit 100 --json tagName --jq '.[15:][].tagName' | while read -r tag; do gh release delete "$tag" --yes --cleanup-tag; done
