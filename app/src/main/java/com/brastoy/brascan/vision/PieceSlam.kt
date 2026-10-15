@@ -27,7 +27,7 @@ class PieceSlam(private val k: Intrinsics) {
     }
 
     /** [alts]: todas as poses possíveis desta observação (simetrias, espelho); a certa se repete entre vistas. */
-    class Obs(val world: Pose, val camCenter: DoubleArray, val weight: Double, val alts: List<Pose> = listOf(world))
+    class Obs(val world: Pose, val camCenter: DoubleArray, val weight: Double, val alts: List<Pose> = listOf(world), val restored: Boolean = false)
 
     inner class MapPiece(val id: Int, shape0: String, var color: Int, val bin: Int, val outline: Int) {
         val obs = ArrayList<Obs>()
@@ -39,6 +39,19 @@ class PieceSlam(private val k: Intrinsics) {
         /** Espalhamento (m) das posições observadas com a escala escolhida — medida de incerteza. */
         var spread = Double.NaN
         var lastSeen = 0
+        /** Vistas e incerteza herdadas de um mapa salvo (sessão anterior). */
+        var baseCount = 0; var baseSpread = Double.NaN
+        /** De quais lados a peça já foi vista: 12 setores de 30° em volta (bits) e maior elevação (graus). */
+        var sectors = 0; var maxElev = -90.0
+        val count get() = baseCount + obs.count { !it.restored }
+
+        fun add(o: Obs) { obs += o; noteView(o.camCenter) }
+
+        fun noteView(cam: DoubleArray) {
+            val d = DoubleArray(3) { cam[it] - pose.t[it] }; val l = sqrt(d.sumOf { it * it }); if (l < 1e-6) return
+            val az = kotlin.math.atan2(d[2], d[0]); sectors = sectors or (1 shl ((((az + Math.PI) / (2 * Math.PI)) * 12).toInt().coerceIn(0, 11)))
+            maxElev = max(maxElev, Math.toDegrees(kotlin.math.asin((d[1] / l).coerceIn(-1.0, 1.0))))
+        }
 
         fun update() {
             val o = obs.takeLast(60)
@@ -53,6 +66,7 @@ class PieceSlam(private val k: Intrinsics) {
             val cur = res.firstOrNull { it.first == size }; val best = res.minBy { it.second }
             val pick = if (cur != null && best.second > cur.second * .85) cur else best
             size = pick.first; spread = pick.second
+            if (baseCount > 0 && !baseSpread.isNaN()) { val n = obs.count { !it.restored }; spread = (spread * n + baseSpread * baseCount) / (n + baseCount) }
             val bestP = pick.third
             // rotação: em triângulos, a orientação certa é a que se repete entre vistas (a espelhada muda com o ângulo)
             val rots: List<Pair<DoubleArray, Double>> = if (outline == 3 && o.size >= 3) {
@@ -77,7 +91,7 @@ class PieceSlam(private val k: Intrinsics) {
         fun toPiece3D(): Piece3D {
             val (u, v, n) = Snap.basis(v3(pose.col(0)), v3(pose.col(1)))
             val share = (votes.maxOf { it.value } / votes.values.sum()).toFloat()
-            return Piece3D(shape, size, color, V3(pose.t[0].toFloat(), pose.t[1].toFloat(), pose.t[2].toFloat()), u, v, n, 0f, 0f, obs.size, spread, share)
+            return Piece3D(shape, size, color, V3(pose.t[0].toFloat(), pose.t[1].toFloat(), pose.t[2].toFloat()), u, v, n, 0f, 0f, count, spread, share)
         }
     }
 
@@ -87,6 +101,9 @@ class PieceSlam(private val k: Intrinsics) {
     var lost = false; private set
     var frames = 0; private set
     var lastMatched = 0; private set
+    /** Mapa veio de uma sessão salva e a câmera já se alinhou com ele. */
+    var relocalized = false; private set
+    val restoredMap get() = map.any { it.baseCount > 0 }
     private var nextId = 1
 
     /** Peças com contorno externo convexo conhecido servem de marcador (L e E ficam de fora por enquanto). */
@@ -175,12 +192,14 @@ class PieceSlam(private val k: Intrinsics) {
         val dets = detect(seg)
         if (dets.isEmpty()) { lost = camera != null; lastMatched = 0; return dets }
         val cam0 = camera
-        if (cam0 == null || map.isEmpty()) {
+        if (map.isEmpty()) {
             val c = Pose(alignUp(upCam), doubleArrayOf(0.0, 0.0, 0.0))
             camera = c; lost = false
             for (d in dets) newPiece(d, c)
             return dets
         }
+        // mapa salvo e câmera ainda desconhecida: relocalizar (só com consenso, nunca força alinhamento)
+        val relocating = cam0 == null
 
         // Associação por consenso (também relocaliza e fecha o laço ao rever peças antigas):
         // cada par (peça vista, peça do mapa, simetria) propõe uma pose de câmera; vence a pose com
@@ -203,18 +222,20 @@ class PieceSlam(private val k: Intrinsics) {
             val sup = ArrayList<Match>(); val ud = HashSet<Detection>(); val um = HashSet<MapPiece>()
             for (g in hyps.filter { agree(it.camEst, h.camEst) }.sortedBy { dist(it.camEst.t, h.camEst.t) })
                 if (g.det !in ud && g.mp !in um) { sup += g; ud += g.det; um += g.mp }
-            val motion = dist(h.camEst.t, cam0.t)
-            val score = sup.size + (if (motion < .15 && !lost) .5 else 0.0) - motion * .3 + sup.sumOf { it.mp.obs.size.coerceAtMost(10) } * .01
+            val motion = if (cam0 == null) 0.0 else dist(h.camEst.t, cam0.t)
+            val score = sup.size + (if (cam0 != null && motion < .15 && !lost) .5 else 0.0) - motion * .3 + sup.sumOf { it.mp.count.coerceAtMost(10) } * .01
             if (score > bestScore) { bestScore = score; matches = sup }
         }
         // uma peça só (sem confirmação) apenas se for continuação suave do quadro anterior
-        if (matches.isEmpty() || (matches.size == 1 && (lost || dist(matches[0].camEst.t, cam0.t) > .12))) { lost = true; lastMatched = 0; return dets }
+        val needed = if (relocating && map.size > 1) 2 else 1
+        if (matches.size < needed || (matches.size == 1 && cam0 != null && (lost || dist(matches[0].camEst.t, cam0.t) > .12))) { lost = true; lastMatched = 0; return dets }
+        if (relocating) relocalized = true
         val takenDet = matches.map { it.det }.toHashSet()
 
         // pose da câmera: média robusta das estimativas de cada peça (descarta as que discordam da mediana)
         val med = DoubleArray(3) { j -> matches.map { it.camEst.t[j] }.sorted()[matches.size / 2] }
         val inl = matches.filter { dist(it.camEst.t, med) < .05 }.ifEmpty { matches }
-        val wts = inl.map { m -> m.mp.obs.size.coerceAtMost(20) * sqrt(m.det.areaPx.toDouble()) / (1 + m.det.rms) }
+        val wts = inl.map { m -> m.mp.count.coerceAtMost(20) * sqrt(m.det.areaPx.toDouble()) / (1 + m.det.rms) }
         val tw = wts.sum()
         val t = DoubleArray(3) { j -> inl.indices.sumOf { inl[it].camEst.t[j] * wts[it] } / tw }
         val ref = Rot.toQuat(inl[0].camEst.r); val acc = DoubleArray(4)
@@ -227,7 +248,7 @@ class PieceSlam(private val k: Intrinsics) {
         for (m in matches) if (m in inlSet) {
             val s = Catalog.SCALE.getValue(m.mp.size).toDouble()
             val cand = m.det.candidatesFor(m.mp.shape).minBy { c -> Rot.angle(cam.compose(scaled(c, s)).r, m.mp.pose.r) }
-            m.mp.obs += Obs(cam.compose(scaled(cand, s)), cam.t.clone(), weight(m.det), m.det.candidatesFor(m.mp.shape).map { cam.compose(scaled(it, s)) }); m.mp.lastSeen = frames
+            m.mp.add(Obs(cam.compose(scaled(cand, s)), cam.t.clone(), weight(m.det), m.det.candidatesFor(m.mp.shape).map { cam.compose(scaled(it, s)) })); m.mp.lastSeen = frames
             m.mp.votes.merge(m.det.shape, .05 + m.det.frontal * m.det.frontal, Double::plus); m.mp.update()
         }
         // as outras peças vistas: associadas ao mapa só pela posição (a orientação de triângulos é ambígua,
@@ -239,11 +260,13 @@ class PieceSlam(private val k: Intrinsics) {
             val sc = near?.let { Catalog.SCALE.getValue(it.size).toDouble() } ?: 1.0
             val alts = near?.let { mp -> d.candidatesFor(mp.shape).map { cam.compose(scaled(it, sc)) } }
             if (near != null && alts!!.minOf { dist(it.t, near.pose.t) } < Catalog.edgeM("grande") * .6) {
-                near.obs += Obs(alts.minBy { Rot.angle(it.r, near.pose.r) }, cam.t.clone(), weight(d) * .5, alts); near.lastSeen = frames
+                near.add(Obs(alts.minBy { Rot.angle(it.r, near.pose.r) }, cam.t.clone(), weight(d) * .5, alts)); near.lastSeen = frames
                 near.votes.merge(d.shape, .05 + d.frontal * d.frontal, Double::plus); near.update()
             } else newPiece(d, cam)
         }
         mergeDuplicates()
+        // detecção passageira (reflexo, peça cortada na borda): vista < 3 vezes e sumiu há 20 quadros → sai do mapa
+        map.removeAll { it.count < 3 && it.baseCount == 0 && frames - it.lastSeen > 20 }
         return dets
     }
 
@@ -253,7 +276,7 @@ class PieceSlam(private val k: Intrinsics) {
         if (map.any { it.outline == d.outline && it.bin == d.bin && dist(it.pose.t, w.t) < Catalog.edgeM("grande") * .6 }) return
         val mp = MapPiece(nextId++, d.shape, d.color, d.bin, d.outline)
         mp.votes.merge(d.shape, .05 + d.frontal * d.frontal, Double::plus)
-        mp.obs += Obs(w, cam.t.clone(), weight(d), d.candidates.map { cam.compose(it) }); mp.lastSeen = frames; mp.update(); map += mp
+        mp.obs += Obs(w, cam.t.clone(), weight(d), d.candidates.map { cam.compose(it) }); mp.lastSeen = frames; mp.update(); mp.noteView(cam.t); map += mp
     }
 
     /** Mesma peça mapeada duas vezes (associação perdida num quadro): junta as observações. */
@@ -266,7 +289,8 @@ class PieceSlam(private val k: Intrinsics) {
                 val na = a.pose.col(2); val nb = b.pose.col(2)
                 val sameNormal = abs(na[0] * nb[0] + na[1] * nb[1] + na[2] * nb[2]) > .82
                 if (a.outline == b.outline && a.bin == b.bin && sameNormal && dist(a.pose.t, b.pose.t) < Catalog.edgeM("grande") * .85) {
-                    a.obs += b.obs; b.votes.forEach { (sh, v) -> a.votes.merge(sh, v, Double::plus) }; a.update(); map.removeAt(j)
+                    a.obs += b.obs; a.baseCount += b.baseCount; a.sectors = a.sectors or b.sectors; a.maxElev = max(a.maxElev, b.maxElev)
+                    b.votes.forEach { (sh, v) -> a.votes.merge(sh, v, Double::plus) }; a.update(); map.removeAt(j)
                 } else j++
             }
             i++
@@ -299,9 +323,125 @@ class PieceSlam(private val k: Intrinsics) {
     }
 
     /** Só entra no modelo o que foi visto em pelo menos 3 quadros (uma vista só pode ser reflexo/ruído). */
-    fun pieces(minObs: Int = 3): List<Piece3D> = map.filter { it.obs.size >= minObs }.map { it.toPiece3D() }
+    fun pieces(minObs: Int = 3): List<Piece3D> = map.filter { it.count >= minObs }.map { it.toPiece3D() }
+
+    /** Mapa em texto (para salvar o projeto e retomar o escaneamento depois). Metros, mundo com Y para cima. */
+    fun export(): String {
+        val sb = StringBuilder("BRASCAN-MAPA 1\n")
+        for (mp in map) {
+            val votes = mp.votes.entries.joinToString(",") { "${it.key}:${"%.4f".format(java.util.Locale.US, it.value)}" }
+            val nums = (mp.pose.r.toList() + mp.pose.t.toList()).joinToString(" ") { "%.6f".format(java.util.Locale.US, it) }
+            sb.append("${mp.id}|$votes|${mp.color}|${mp.bin}|${mp.outline}|${mp.size}|${if (mp.spread.isNaN()) "nan" else "%.5f".format(java.util.Locale.US, mp.spread)}|${mp.count}|${mp.sectors}|${"%.1f".format(java.util.Locale.US, mp.maxElev)}|$nums\n")
+        }
+        return sb.toString()
+    }
+
+    /**
+     * Retoma um mapa salvo. A câmera começa desconhecida: o próximo quadro com ≥ 2 peças conhecidas
+     * concordando alinha a sessão nova com a antiga (sem consenso, nada é adicionado).
+     */
+    fun restore(text: String): Int {
+        val lines = text.lines(); if (lines.firstOrNull()?.startsWith("BRASCAN-MAPA") != true) return 0
+        map.clear(); camera = null; relocalized = false
+        for (ln in lines.drop(1)) {
+            val f = ln.split("|"); if (f.size < 11) continue
+            val votes = f[1].split(",").filter { ":" in it }.associate { it.substringBefore(":") to it.substringAfter(":").toDouble() }
+            val mp = MapPiece(f[0].toInt(), votes.maxByOrNull { it.value }?.key ?: "quadrado", f[2].toInt(), f[3].toInt(), f[4].toInt())
+            mp.votes.clear(); mp.votes.putAll(votes)
+            mp.size = f[5]; val spr = f[6].toDoubleOrNull() ?: Double.NaN
+            val n = f[10].trim().split(" ").map { it.toDouble() }
+            mp.pose = Pose(DoubleArray(9) { n[it] }, doubleArrayOf(n[9], n[10], n[11]))
+            mp.baseCount = f[7].toInt(); mp.baseSpread = spr; mp.sectors = f[8].toInt(); mp.maxElev = f[9].toDouble()
+            // uma observação "resumo" com o peso das vistas antigas (câmera fictícia na frente da peça)
+            val nrm = mp.pose.col(2)
+            mp.obs += Obs(mp.pose, DoubleArray(3) { mp.pose.t[it] + nrm[it] * .35 }, mp.baseCount.toDouble(), listOf(mp.pose), restored = true)
+            mp.spread = spr
+            map += mp; nextId = max(nextId, mp.id + 1)
+        }
+        lost = true
+        return map.size
+    }
+
+    data class Advice(val text: String, val targetId: Int?, val priority: Double)
+    private val adviceSeen = HashMap<String, Pair<Int, Int>>() // dica → (quadro em que começou, contagem naquele momento)
+
+    /**
+     * Escaneamento ativo: o que observar agora para ganhar mais informação. Prioridade: rastreio >
+     * peça ainda fora do modelo > forma/tamanho/posição em dúvida > lado nunca visto > vista de cima.
+     * Uma dica que não melhorou em ~40 quadros sai da frente por um tempo (não pede o impossível).
+     */
+    fun advice(limit: Int = 3): List<Advice> {
+        val out = ArrayList<Advice>()
+        if (map.isEmpty()) return listOf(Advice("Aponte para as peças coloridas", null, 100.0))
+        if (camera == null) return listOf(Advice("Procurando a construção salva: mostre 2 peças que já foram escaneadas", null, 100.0))
+        if (lost) out += Advice("Perdi a posição: volte a mostrar peças já vistas", null, 90.0)
+        val solid = map.filter { it.count >= 3 }
+        val confirming = ArrayList<MapPiece>()
+        for (mp in map) {
+            if (mp.count < 3 && frames - mp.lastSeen > 2) continue // só pede para segurar no que está na tela agora
+            val name = "${(Catalog.LABEL[mp.shape] ?: mp.shape).lowercase()} ${colorName(mp.bin)}"
+            val share = mp.votes.maxOf { it.value } / mp.votes.values.sum()
+            when {
+                mp.count < 3 -> confirming += mp
+                share < .7 -> out += Advice("Chegue mais perto do $name e olhe de frente: forma em dúvida", mp.id, 40.0)
+                mp.count >= 3 && mp.obs.count { !it.restored } >= 3 && viewSpreadDeg(mp) < 8 -> out += Advice("Mova o celular de lado mostrando o $name: preciso de outro ângulo para medir o tamanho", mp.id, 35.0)
+                !mp.spread.isNaN() && mp.spread > .015 -> out += Advice("Mostre o $name de outro ângulo: posição incerta (±${"%.1f".format(mp.spread * 100)} cm)", mp.id, 30.0 + mp.spread * 100)
+            }
+        }
+        if (confirming.size == 1) { val mp = confirming[0]; out += Advice("Segure a câmera no ${(Catalog.LABEL[mp.shape] ?: mp.shape).lowercase()} ${colorName(mp.bin)} mais um instante", mp.id, 50.0) }
+        else if (confirming.size > 1) out += Advice("Segure a câmera parada um instante: ${confirming.size} peças sendo confirmadas", confirming[0].id, 50.0)
+        // cobertura em volta da construção
+        val seen = solid.fold(0) { a, m -> a or m.sectors }; val nSeen = Integer.bitCount(seen)
+        if (solid.isNotEmpty() && nSeen < 9) {
+            val c = DoubleArray(3) { j -> solid.sumOf { it.pose.t[j] } / solid.size }
+            // maior sequência de setores nunca vistos → direção do centro dela
+            var bestStart = 0; var bestLen = 0
+            for (st in 0 until 12) { var l = 0; while (l < 12 && (seen shr ((st + l) % 12)) and 1 == 0) l++; if (l > bestLen) { bestLen = l; bestStart = st } }
+            if (bestLen > 0) {
+                val az = (bestStart + bestLen / 2.0 + .5) / 12 * 2 * Math.PI - Math.PI
+                val cam = camera!!; val fwd = norm(doubleArrayOf(c[0] - cam.t[0], 0.0, c[2] - cam.t[2]))
+                val right = doubleArrayOf(-fwd[2], 0.0, fwd[0]) // frente × cima
+                val r = max(.25, dist(c, cam.t))
+                val target = doubleArrayOf(c[0] + kotlin.math.cos(az) * r, cam.t[1], c[2] + kotlin.math.sin(az) * r)
+                val side = (target[0] - cam.t[0]) * right[0] + (target[2] - cam.t[2]) * right[2]
+                val behind = (target[0] - c[0]) * fwd[0] + (target[2] - c[2]) * fwd[2] > r * .5
+                out += Advice(if (behind) "Falta ver o lado de trás: dê a volta na construção" else "Falta ver um lado: ande para a ${if (side > 0) "direita" else "esquerda"} em volta da construção", null, 20.0 + bestLen)
+            }
+        }
+        if (solid.isNotEmpty() && solid.maxOf { it.maxElev } < 55) out += Advice("Escaneie também de cima, apontando para baixo", null, 15.0) // 55°: celular bem acima, olhando para baixo
+
+        // não insistir no que não está melhorando
+        val result = out.filter { a ->
+            val metric = a.targetId?.let { id -> map.firstOrNull { it.id == id }?.count } ?: nSeen
+            val st = adviceSeen.getOrPut(a.text) { frames to metric }
+            when {
+                metric != st.second -> { adviceSeen[a.text] = frames to metric; true }
+                frames - st.first > 140 -> { adviceSeen[a.text] = frames to metric; true }
+                else -> frames - st.first <= 40
+            }
+        }
+        return result.sortedByDescending { it.priority }.distinctBy { it.text }.take(limit)
+    }
+
+    private fun viewSpreadDeg(mp: MapPiece): Double {
+        val o = mp.obs.filter { !it.restored }
+        val dirs = o.map { ob -> norm(DoubleArray(3) { ob.world.t[it] - ob.camCenter[it] }) }
+        var mx = 0.0
+        for (i in dirs.indices) for (j in i + 1 until dirs.size) mx = max(mx, acos(dirs[i].indices.sumOf { dirs[i][it] * dirs[j][it] }.coerceIn(-1.0, 1.0)))
+        return Math.toDegrees(mx)
+    }
+
+    /** Centro da peça do mapa projetado na imagem atual (pixels do sensor), ou null se atrás/fora. */
+    fun projectToImage(id: Int): DoubleArray? {
+        val cam = camera ?: return null; val mp = map.firstOrNull { it.id == id } ?: return null
+        val c = cam.inverse().apply(mp.pose.t); if (c[2] < .02) return null
+        return doubleArrayOf(k.fx * c[0] / c[2] + k.cx, k.fy * c[1] / c[2] + k.cy)
+    }
 
     companion object {
+        private val COLOR_NAMES = listOf("vermelho", "laranja", "amarelo", "amarelo", "verde", "verde", "verde", "azul-claro", "azul", "azul", "roxo", "rosa")
+        fun colorName(bin: Int) = COLOR_NAMES[bin.coerceIn(0, 11)]
+
         /** Molde de contorno usado no PnP para cada forma. */
         fun outlineOf(shape: String) = when (shape) { "retangulo" -> "retangulo"; "equilatero", "retanguloTri", "isoceles" -> shape; else -> "quadrado" }
         fun dist(a: DoubleArray, b: DoubleArray) = sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2]))

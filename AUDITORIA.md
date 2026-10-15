@@ -56,18 +56,22 @@ fotos reais das peças enviadas pelo usuário. **Não há celular físico aqui**
 | 5 Reconhecimento e associação | 🟠 foto ✅; AR associa por voxel/cor, sem rastrear identidade entre extrações |
 | 6 Loop closure | ⬜ |
 | 7 GPS / Wi-Fi RTT / BLE | ⬜ (auxiliar; não afeta posição de peça) |
-| 8 Âncoras persistentes / retomada | ⬜ |
+| 8 Âncoras persistentes / retomada | ✅ (sintético + emulador) projeto atual salvo sozinho (volta após matar o app — testado), projetos com nome (salvar/abrir/apagar/novo), mapa do SLAM salvo em texto; retomada só alinha com ≥ 2 peças conhecidas concordando (`SlamResumeAdviceTest`: meia volta → salvar → outra meia volta realinha, pior erro entre pares 2,4 cm; mapa de outra construção nunca é forçado); botão "Ignorar salvo" = correção manual. Sem GPS (não precisa) |
 | 9 Inferência de interiores | ⬜ |
 | 10 Mapa de confiança | ✅ (emulador) verde/amarelo/vermelho/cinza por evidência medida (vistas, espalhamento, IoU do molde, votos de forma, empurrão da colisão, confirmação) com lista de motivos; `ConfidenceMeasureTest` |
-| 11 Active scanning | 🟠 cobertura em 12 setores + dicas simples |
+| 11 Active scanning | ✅ (sintético) dicas por prioridade: rastreio > peças sendo confirmadas > forma em dúvida > tamanho sem paralaxe > posição incerta (±cm) > lado nunca visto (esquerda/direita/trás) > vista de cima (< 55°); peça-alvo marcada na imagem; dica que não melhora em ~40 quadros sai da frente; detecções passageiras são descartadas do mapa |
 | 12 Medições e Raio-X | ✅ (emulador) altura/largura/profundidade/volume/inclinação e distância entre peças, cada uma marcada como observada/derivada/estimada com ± quando medível; escala explícita em foto (grande = 7,5 cm). Raio-X: corte horizontal e lateral no shader, paredes fantasma, isolar peça, explosão. Medição contra objeto físico de tamanho conhecido: **não feita** (sem régua) |
 | 13 B5 validado | ✅ exportação conservadora; modo experimental depende das hipóteses (fase 9) |
 | 14 Atualizações GitHub | ✅ |
 | 15 Otimização e testes físicos | ⛔ depende de celular físico |
 
-## 4. Divergências com o simulador (para decidir)
+## 4. Divergências com o simulador (decididas em 15/10/2026)
 
-- **Tamanho médio**: simulador 0,65 × grande; foto real 0,81 (quadrado laranja 130 px × rosa 106 px na mesma foto).
-- **Porta**: no simulador o vão é retangular e encostado embaixo (−0,48..0,30); nas peças reais o vão é em arco e centrado.
-- **Janela 4 vidros e janela octogonal com encaixe**: no simulador `janela` e `moldura` têm a mesma geometria (furo quadrado 0,6).
-- **Encaixe**: no simulador só existe no tamanho médio (lado 0,65); na foto mede ≈ 0,83 do grande.
+O simulador (fonte de verdade) foi alterado para as medidas das fotos; `vision/Catalog.kt` usa a mesma geometria.
+
+- **Tamanho médio**: 0,65 → **0,81** do grande.
+- **Encaixe**: lado próprio de **0,83 do grande** (só existe no médio; sem ímãs).
+- **Porta**: vão de 0,52 centrado (−0,36..+0,37) com topo em semicírculo de raio 0,26.
+- **Janela**: 4 vidros de 0,275 com cruz de 0,11. **Moldura**: vão octogonal regular de 0,64 (a "janela com encaixe octogonal").
+- Códigos B1/B2/B4/B5 antigos continuam decodificando, mas com a geometria nova: peças médias de construções
+  antigas que agora encostam nas vizinhas são rejeitadas na importação (castelo gigante: 1133/1221).

@@ -97,6 +97,16 @@ private fun App() {
     val update by Updater.state.collectAsState()
     var arOpen by rememberSaveable { mutableStateOf(false) }
     var markerOpen by rememberSaveable { mutableStateOf(false) }
+    var resumeMap by remember { mutableStateOf<String?>(null) }
+    // projeto atual: volta sozinho depois de uma interrupção e é salvo a cada mudança
+    val store = remember { com.brastoy.brascan.scan.ProjectStore(ctx) }
+    LaunchedEffect(Unit) { store.load("atual")?.let { scan.load(it, it.pid.ifBlank { scan.projectId }) } }
+    LaunchedEffect(Unit) {
+        androidx.compose.runtime.snapshotFlow { scan.saveKey() }.collect {
+            kotlinx.coroutines.delay(800)
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { runCatching { store.save("atual", scan.toProject()) } }
+        }
+    }
 
     // Checa o GitHub a cada 30 s enquanto o app está aberto: push na main → APK novo no celular em poucos minutos.
     val lifecycle = LocalLifecycleOwner.current.lifecycle
@@ -108,7 +118,7 @@ private fun App() {
 
     if (markerOpen) {
         androidx.activity.compose.BackHandler { markerOpen = false }
-        com.brastoy.brascan.ar.MarkerScanScreen(onClose = { markerOpen = false }, onDone = { found -> scan.importScan(found); markerOpen = false; tab = Tab.MODELO })
+        com.brastoy.brascan.ar.MarkerScanScreen(initialMap = resumeMap, onClose = { markerOpen = false }, onDone = { found, map -> scan.importScan(found, map); markerOpen = false; tab = Tab.MODELO })
         return
     }
     if (arOpen) {
@@ -134,7 +144,7 @@ private fun App() {
             Box(Modifier.weight(1f)) {
                 when (tab) {
                     Tab.CAMPO -> FieldScreen(field, hasSensor)
-                    Tab.SCAN -> ScanScreen(scan, openAr = { markerOpen = true }, openArCore = { arOpen = true }) { tab = Tab.MODELO }
+                    Tab.SCAN -> ScanScreen(scan, openAr = { resumeMap = null; markerOpen = true }, openArCore = { arOpen = true }, openResume = { resumeMap = scan.slamMap; markerOpen = true }) { tab = Tab.MODELO }
                     Tab.MODELO -> ModelScreen(scan)
                     Tab.AJUSTES -> Settings(update)
                 }

@@ -84,6 +84,10 @@ data class MarkerStatus(
     val imgW: Int = 1, val imgH: Int = 1,
     val fps: Float = 0f,
     val gravity: Boolean = false,
+    /** Peça que a dica principal quer que você mostre (já em pé, pixels da imagem analisada). */
+    val target: Offset? = null,
+    val advice: List<String> = emptyList(),
+    val resuming: Boolean = false,
 )
 
 /**
@@ -93,14 +97,14 @@ data class MarkerStatus(
 @OptIn(ExperimentalCamera2Interop::class)
 @SuppressLint("UnsafeOptInUsageError")
 @Composable
-fun MarkerScanScreen(onClose: () -> Unit, onDone: (List<Piece3D>) -> Unit) {
+fun MarkerScanScreen(initialMap: String? = null, onClose: () -> Unit, onDone: (List<Piece3D>, String?) -> Unit) {
     val ctx = LocalContext.current
     val owner = LocalLifecycleOwner.current
     var permission by remember { mutableStateOf(ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) }
     val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { permission = it }
     LaunchedEffect(Unit) { if (!permission) ask.launch(Manifest.permission.CAMERA) }
     var status by remember { mutableStateOf(MarkerStatus()) }
-    val engine = remember { Engine(ctx) { status = it } }
+    val engine = remember { Engine(ctx, initialMap) { status = it } }
     DisposableEffect(Unit) { engine.startSensors(); onDispose { engine.stop() } }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
@@ -112,6 +116,10 @@ fun MarkerScanScreen(onClose: () -> Unit, onDone: (List<Piece3D>) -> Unit) {
             Canvas(Modifier.fillMaxSize()) {
                 val s = status; val k = max(size.width / s.imgW, size.height / s.imgH)
                 val ox = (size.width - s.imgW * k) / 2; val oy = (size.height - s.imgH * k) / 2
+                s.target?.let { t ->
+                    val c = Offset(ox + t.x * k, oy + t.y * k)
+                    drawCircle(Color(0xFFFFC531), 46f, c, style = Stroke(width = 7f)); drawCircle(Color(0xFFFFC531), 10f, c)
+                }
                 for ((pts, col) in s.outlines) {
                     if (pts.size < 3) continue
                     val path = Path().apply { moveTo(ox + pts[0].x * k, oy + pts[0].y * k); pts.drop(1).forEach { lineTo(ox + it.x * k, oy + it.y * k) }; close() }
@@ -124,15 +132,16 @@ fun MarkerScanScreen(onClose: () -> Unit, onDone: (List<Piece3D>) -> Unit) {
                 FilledTonalIconButton(onClick = onClose) { Icon(Icons.Rounded.Close, "Fechar") }
                 Spacer(Modifier.width(10.dp))
                 Column(Modifier.clip(RoundedCornerShape(16.dp)).background(Color(0xCC0A111E)).padding(horizontal = 14.dp, vertical = 10.dp).weight(1f)) {
-                    Text(if (!permission) "Permita o uso da câmera" else status.hint, color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+                    Text(if (!permission) "Permita o uso da câmera" else status.advice.firstOrNull() ?: status.hint, color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+                    status.advice.drop(1).forEach { Text("· $it", color = Color(0xFFC9D6EA), fontSize = 12.sp) }
                     Text("Sem Google/ARCore · peças como marcadores · ${status.mapped} no mapa · ${"%.0f".format(status.fps)} quadros/s" +
                         (if (status.gravity) "" else " · sem sensor de gravidade"), color = Palette.muted, fontSize = 12.sp)
                 }
             }
         }
         Row(Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(16.dp).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            FilledTonalButton(onClick = { engine.reset() }, modifier = Modifier.height(54.dp)) { Icon(Icons.Rounded.Refresh, null); Spacer(Modifier.width(6.dp)); Text("Recomeçar") }
-            Button(enabled = status.pieces.isNotEmpty(), onClick = { onDone(status.pieces) }, modifier = Modifier.weight(1f).height(54.dp)) {
+            FilledTonalButton(onClick = { engine.reset() }, modifier = Modifier.height(54.dp)) { Icon(Icons.Rounded.Refresh, null); Spacer(Modifier.width(6.dp)); Text(if (status.resuming) "Ignorar salvo" else "Recomeçar") }
+            Button(enabled = status.pieces.isNotEmpty(), onClick = { onDone(status.pieces, engine.exportMap()) }, modifier = Modifier.weight(1f).height(54.dp)) {
                 Icon(Icons.Rounded.ViewInAr, null); Spacer(Modifier.width(8.dp)); Text("Usar no 3D (${status.pieces.size})", fontWeight = FontWeight.Bold)
             }
         }
@@ -141,7 +150,7 @@ fun MarkerScanScreen(onClose: () -> Unit, onDone: (List<Piece3D>) -> Unit) {
 
 /** Câmera + sensores + SLAM numa thread de análise só (quadros antigos são descartados). */
 @OptIn(ExperimentalCamera2Interop::class)
-private class Engine(private val ctx: Context, private val publish: (MarkerStatus) -> Unit) : SensorEventListener {
+private class Engine(private val ctx: Context, private var initialMap: String?, private val publish: (MarkerStatus) -> Unit) : SensorEventListener {
     private val exec = Executors.newSingleThreadExecutor()
     private val sm = ctx.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     @Volatile private var gravity: FloatArray? = null
@@ -158,7 +167,11 @@ private class Engine(private val ctx: Context, private val publish: (MarkerStatu
     override fun onAccuracyChanged(s: Sensor?, a: Int) {}
 
     fun stop() { sm.unregisterListener(this); provider?.unbindAll(); exec.shutdown() }
-    fun reset() { exec.execute { slam = intr?.let { PieceSlam(it) } } }
+    /** Recomeçar do zero (também serve para ignorar um mapa salvo que não está batendo). */
+    fun reset() { exec.execute { initialMap = null; slam = intr?.let { PieceSlam(it) } } }
+
+    /** Mapa atual em texto (lido na thread de análise para não cruzar com o rastreio). */
+    fun exportMap(): String? = runCatching { exec.submit<String?> { slam?.export() }.get() }.getOrNull()
 
     fun bind(owner: androidx.lifecycle.LifecycleOwner, pv: PreviewView) {
         val f = ProcessCameraProvider.getInstance(ctx)
@@ -219,7 +232,7 @@ private class Engine(private val ctx: Context, private val publish: (MarkerStatu
         val outW = 480
         val (rgb, w, h) = ArScanView.yuvToArgb(image, outW)
         val k = intr ?: intrinsics(w, h).also { intr = it }
-        val s = slam ?: PieceSlam(k).also { slam = it }
+        val s = slam ?: PieceSlam(k).also { sl -> initialMap?.let { sl.restore(it) }; slam = sl }
         val seg = Segmenter.segment(rgb, w, h, minFrac = .0015f)
         val up = upInCamera()
         val dets = s.track(seg, up)
@@ -233,6 +246,8 @@ private class Engine(private val ctx: Context, private val publish: (MarkerStatu
         }
         val (uw, uh) = if (rot == 90 || rot == 270) h to w else w to h
         val pieces = s.pieces()
+        val adv = s.advice()
+        val target = adv.firstOrNull()?.targetId?.let { id -> s.projectToImage(id) }?.let { upright(it[0], it[1]) }
         val hint = when {
             dets.isEmpty() -> "Não vejo peças: aproxime e melhore a luz"
             s.lost -> "Perdi a posição: volte a mostrar peças já vistas"
@@ -240,6 +255,7 @@ private class Engine(private val ctx: Context, private val publish: (MarkerStatu
             pieces.isEmpty() -> "Continue: cada peça precisa aparecer em 3 quadros"
             else -> "${pieces.size} peças no modelo — mostre os outros lados para refinar"
         }
-        publish(MarkerStatus(hint, !s.lost, s.map.size, pieces, dets.map { d -> d.imgCorners.map { upright(it[0], it[1]) } to d.color }, uw, uh, fps, up != null))
+        publish(MarkerStatus(hint, !s.lost, s.map.size, pieces, dets.map { d -> d.imgCorners.map { upright(it[0], it[1]) } to d.color }, uw, uh, fps, up != null,
+            target, adv.map { it.text }, s.restoredMap && !s.relocalized))
     }
 }

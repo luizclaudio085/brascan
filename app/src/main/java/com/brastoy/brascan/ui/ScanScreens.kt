@@ -44,6 +44,7 @@ import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.KeyboardArrowUp
 import androidx.compose.material.icons.rounded.PhotoCamera
 import androidx.compose.material.icons.rounded.PhotoLibrary
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.RotateRight
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.ViewInAr
@@ -125,11 +126,29 @@ class ScanState {
         return cache
     }
     fun sceneKey(): Any = Triple(pieces.toList(), vista, selected)
+    /** Mapa do scanner 3D (para continuar o escaneamento depois). */
+    var slamMap by mutableStateOf<String?>(null)
+    var projectId by mutableStateOf(com.brastoy.brascan.scan.ProjectStore.newId())
+    var projectName by mutableStateOf("Sem nome")
+
     /** Substitui as peças pelas reconstruídas no scanner 3D (pose real, sem foto). */
-    fun importScan(found: List<com.brastoy.brascan.vision.Piece3D>) {
+    fun importScan(found: List<com.brastoy.brascan.vision.Piece3D>, map: String? = null) {
         image = null; selected = -1; pieces.clear()
         val list = Layout.fromScan(found, nextId); nextId += list.size; pieces.addAll(list)
+        if (map != null) slamMap = map
     }
+
+    fun toProject() = com.brastoy.brascan.scan.Project(projectName, System.currentTimeMillis(), vista, pieces.toList(), slamMap, image, projectId)
+
+    fun load(p: com.brastoy.brascan.scan.Project, id: String) {
+        selected = -1; pieces.clear(); pieces.addAll(p.pieces); nextId = (p.pieces.maxOfOrNull { it.id } ?: 0) + 1
+        vista = p.vista; image = p.photo; slamMap = p.slamMap; projectName = p.name; projectId = id
+    }
+
+    fun clear() { selected = -1; pieces.clear(); image = null; slamMap = null; projectName = "Sem nome"; projectId = com.brastoy.brascan.scan.ProjectStore.newId() }
+
+    /** Muda sempre que algo que vale salvar muda. */
+    fun saveKey(): Any = listOf(pieces.toList(), vista, slamMap, image, projectName)
     /** Toda edição feita pelo usuário conta como confirmação da peça. */
     fun update(id: Int, f: (Piece) -> Piece) {
         val i = pieces.indexOfFirst { it.id == id }; if (i < 0) return
@@ -139,7 +158,7 @@ class ScanState {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ScanScreen(st: ScanState, openAr: () -> Unit, openArCore: () -> Unit, open3D: () -> Unit) {
+fun ScanScreen(st: ScanState, openAr: () -> Unit, openArCore: () -> Unit, openResume: () -> Unit, open3D: () -> Unit) {
     val ctx = LocalContext.current
     var photoUri by remember { mutableStateOf<Uri?>(null) }
     var pendingLoad by remember { mutableStateOf<Uri?>(null) }
@@ -172,6 +191,9 @@ fun ScanScreen(st: ScanState, openAr: () -> Unit, openArCore: () -> Unit, open3D
             // ARCore só aparece se já estiver instalado: nunca pede para instalar nada do Google
             val arCoreInstalled = remember {
                 runCatching { com.google.ar.core.ArCoreApk.getInstance().checkAvailability(ctx) == com.google.ar.core.ArCoreApk.Availability.SUPPORTED_INSTALLED }.getOrDefault(false)
+            }
+            if (st.slamMap != null) FilledTonalButton(onClick = openResume, modifier = Modifier.fillMaxWidth().padding(top = 8.dp).height(50.dp)) {
+                Icon(Icons.Rounded.Refresh, null); Spacer(Modifier.width(8.dp)); Text("Continuar escaneamento salvo")
             }
             if (arCoreInstalled) androidx.compose.material3.TextButton(onClick = openArCore, modifier = Modifier.fillMaxWidth()) {
                 Text("Usar ARCore do Google (opcional, este celular tem)", color = Palette.muted, fontSize = 13.sp)
@@ -379,7 +401,53 @@ private fun ExportPanel(st: ScanState, demo: Boolean) {
         }, modifier = Modifier.weight(1f)) { Icon(Icons.Rounded.Share, null); Spacer(Modifier.width(6.dp)); Text("JSON") }
     }
     b5?.takeIf { it != "…" }?.let { Text(it, color = if (it.startsWith("Não")) Palette.pink else Palette.y, fontSize = 12.sp, maxLines = 6, modifier = Modifier.padding(top = 8.dp)) }
+    ProjectsRow(st)
     Text("Arraste: girar · pinça: zoom · toque duplo: recentralizar", color = Palette.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
+}
+
+/** Projeto: nome, salvar com nome, abrir/apagar salvos, começar um novo. O atual é salvo sozinho. */
+@Composable
+private fun ProjectsRow(st: ScanState) {
+    val ctx = LocalContext.current
+    val store = remember { com.brastoy.brascan.scan.ProjectStore(ctx) }
+    var dialog by remember { mutableStateOf<String?>(null) } // "salvar" | "abrir"
+    var entries by remember { mutableStateOf(emptyList<com.brastoy.brascan.scan.ProjectStore.Entry>()) }
+    Row(Modifier.padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Projeto: ${st.projectName}", color = Color.White, fontSize = 13.sp, modifier = Modifier.weight(1f), maxLines = 1)
+        OutlinedButton(onClick = { dialog = "salvar" }) { Text("Salvar") }
+        OutlinedButton(onClick = { entries = store.list(); dialog = "abrir" }) { Text("Abrir") }
+    }
+    when (dialog) {
+        "salvar" -> {
+            var name by remember { mutableStateOf(if (st.projectName == "Sem nome") "" else st.projectName) }
+            androidx.compose.material3.AlertDialog(onDismissRequest = { dialog = null },
+                title = { Text("Salvar projeto") },
+                text = { androidx.compose.material3.OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Nome") }, singleLine = true) },
+                confirmButton = { Button(enabled = name.isNotBlank(), onClick = {
+                    st.projectName = name.trim(); store.save(st.projectId, st.toProject()); dialog = null; toast(ctx, "Projeto salvo")
+                }) { Text("Salvar") } },
+                dismissButton = { OutlinedButton(onClick = { dialog = null }) { Text("Cancelar") } })
+        }
+        "abrir" -> androidx.compose.material3.AlertDialog(onDismissRequest = { dialog = null },
+            title = { Text("Projetos") },
+            text = {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    if (entries.isEmpty()) Text("Nenhum projeto salvo ainda.", color = Palette.muted)
+                    entries.forEach { e ->
+                        Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(e.name, color = Color.White, fontWeight = FontWeight.SemiBold)
+                                Text("${e.pieces} peças · ${java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.SHORT, java.text.DateFormat.SHORT).format(java.util.Date(e.savedAt))}", color = Palette.muted, fontSize = 12.sp)
+                            }
+                            FilledTonalButton(onClick = { store.load(e.id)?.let { st.load(it, e.id) }; dialog = null }) { Text("Abrir") }
+                            FilledTonalIconButton(onClick = { store.delete(e.id); entries = store.list() }) { Icon(Icons.Rounded.Delete, "Apagar") }
+                        }
+                    }
+                }
+            },
+            confirmButton = { OutlinedButton(onClick = { st.clear(); dialog = null }) { Text("Novo projeto") } },
+            dismissButton = { OutlinedButton(onClick = { dialog = null }) { Text("Fechar") } })
+    }
 }
 
 @Composable
