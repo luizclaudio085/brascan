@@ -17,7 +17,7 @@ data class Evidence(
     val accepted: Boolean = false,
     val view: String = "", // foto: "frente" ou "cima"
 ) {
-    enum class Source(val label: String) { FOTO("foto"), SCANNER("scanner 3D"), EXEMPLO("exemplo"), MANUAL("marcada à mão") }
+    enum class Source(val label: String) { FOTO("foto"), SCANNER("scanner 3D"), EXEMPLO("exemplo"), MANUAL("marcada à mão"), HIPOTESE("hipótese") }
 }
 
 /** Verde: observado e validado · Amarelo: inferido/pouco confiável · Vermelho: conflito · Cinza: desconhecido. */
@@ -39,6 +39,8 @@ object Confidence {
      */
     fun assess(e: Evidence?, pushedM: Double, edgeM: Double): Assessment {
         if (e == null || e.source == Evidence.Source.EXEMPLO) return Assessment(Level.CINZA, listOf("Peça de exemplo: nada foi observado"))
+        if (e.source == Evidence.Source.HIPOTESE) return Assessment(if (e.accepted) Level.AMARELO else Level.CINZA,
+            listOf("Hipótese (não foi vista): ${if (e.accepted) "aceita por você" else "aguardando você aceitar ou rejeitar"}"))
         val why = ArrayList<String>(); var level = Level.VERDE
         fun atLeast(l: Level) { if (l.ordinal > level.ordinal) level = l } // VERDE < AMARELO < VERMELHO
 
@@ -63,7 +65,7 @@ object Confidence {
                 }
                 if (!e.shapeShare.isNaN() && e.shapeShare < .7f) { atLeast(Level.AMARELO); why += "Forma em dúvida: só %.0f%% das vistas concordam".format(e.shapeShare * 100) }
             }
-            Evidence.Source.EXEMPLO -> Unit
+            Evidence.Source.EXEMPLO, Evidence.Source.HIPOTESE -> Unit
         }
         if (pushedM > edgeM * .3) { atLeast(Level.VERMELHO); why += "Conflito: atravessava outra peça e foi deslocada ${cm(pushedM)}" }
         else if (pushedM > edgeM * .08) { atLeast(Level.AMARELO); why += "Ajustada ${cm(pushedM)} para não atravessar outra peça" }

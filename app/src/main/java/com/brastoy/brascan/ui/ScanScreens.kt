@@ -28,6 +28,7 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -37,6 +38,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.DeleteSweep
@@ -94,6 +97,7 @@ import com.brastoy.brascan.vision.Assessment
 import com.brastoy.brascan.vision.Catalog
 import com.brastoy.brascan.vision.Confidence
 import com.brastoy.brascan.vision.Evidence
+import com.brastoy.brascan.vision.Inference
 import com.brastoy.brascan.vision.Level
 import com.brastoy.brascan.vision.Measure
 import com.brastoy.brascan.three.Camera
@@ -138,17 +142,44 @@ class ScanState {
         if (map != null) slamMap = map
     }
 
-    fun toProject() = com.brastoy.brascan.scan.Project(projectName, System.currentTimeMillis(), vista, pieces.toList(), slamMap, image, projectId)
+    fun toProject() = com.brastoy.brascan.scan.Project(projectName, System.currentTimeMillis(), vista, pieces.toList(), slamMap, image, projectId, rejected.toList())
 
     fun load(p: com.brastoy.brascan.scan.Project, id: String) {
         selected = -1; pieces.clear(); pieces.addAll(p.pieces); nextId = (p.pieces.maxOfOrNull { it.id } ?: 0) + 1
         vista = p.vista; image = p.photo; slamMap = p.slamMap; projectName = p.name; projectId = id
+        rejected.clear(); rejected.addAll(p.rejected)
     }
 
-    fun clear() { selected = -1; pieces.clear(); image = null; slamMap = null; projectName = "Sem nome"; projectId = com.brastoy.brascan.scan.ProjectStore.newId() }
+    fun clear() { selected = -1; pieces.clear(); image = null; slamMap = null; rejected.clear(); projectName = "Sem nome"; projectId = com.brastoy.brascan.scan.ProjectStore.newId() }
+
+    /** Hipóteses rejeitadas pelo usuário (chaves estáveis); as aceitas viram peças marcadas como hipótese. */
+    val rejected = androidx.compose.runtime.mutableStateListOf<String>()
+    private var hypKey: Any? = null
+    private var hypCache: List<Inference.Hypothesis> = emptyList()
+
+    /** Hipóteses ainda em aberto para o modelo atual (recalculadas quando o modelo muda). */
+    fun hypotheses(): List<Inference.Hypothesis> {
+        val key = listOf(sceneKey(), rejected.toList())
+        if (key != hypKey) {
+            val obs = placed().map { Measure.P(it.piece.id, it.piece.shape, it.piece.size, it.center, it.u, it.v, it.edge, it.piece.evidence) }
+            hypCache = Inference.infer(obs).filter { it.key !in rejected }
+            hypKey = key
+        }
+        return hypCache
+    }
+
+    /** Aceitar: as peças da hipótese entram no modelo (marcadas como hipótese) e as alternativas do grupo saem. */
+    fun accept(h: Inference.Hypothesis) {
+        for (o in hypotheses().filter { it.group == h.group && it.key != h.key }) rejected += o.key
+        for (hp in h.pieces) pieces += Piece(newId(), shape = hp.shape, size = hp.size, color = 0xFFB9C4D6.toInt(), pos = hp.center, pu = hp.u, pv = hp.v,
+            evidence = Evidence(Evidence.Source.HIPOTESE, accepted = true))
+        if (h.pieces.isEmpty()) rejected += h.key // "interior vazio": decisão registrada, nada para adicionar
+    }
+
+    fun reject(h: Inference.Hypothesis) { rejected += h.key }
 
     /** Muda sempre que algo que vale salvar muda. */
-    fun saveKey(): Any = listOf(pieces.toList(), vista, slamMap, image, projectName)
+    fun saveKey(): Any = listOf(pieces.toList(), vista, slamMap, image, projectName, rejected.toList())
     /** Toda edição feita pelo usuário conta como confirmação da peça. */
     fun update(id: Int, f: (Piece) -> Piece) {
         val i = pieces.indexOfFirst { it.id == id }; if (i < 0) return
@@ -318,10 +349,12 @@ fun ModelScreen(st: ScanState) {
     val clipY = if (mode == Mode.RAIOX && cutY < .999f) yMax * cutY else 9000f
     val clipX = if (mode == Mode.RAIOX && cutX < .999f) xMin + (xMax - xMin) * cutX else 9000f
     val highlight = when (mode) { Mode.MEDIR -> if (pickB >= 0) pickB else pickA; else -> st.selected }
+    val hyps = if (demo || mode !in setOf(Mode.CONFIANCA, Mode.RAIOX)) emptyList() else st.hypotheses()
+    var focusHyp by remember { mutableStateOf<String?>(null) }
 
     Column(Modifier.fillMaxSize()) {
         Box(Modifier.fillMaxWidth().weight(1f)) {
-            GlViewport(Modifier.fillMaxSize(), camera, key = listOf(if (demo) "demo" else st.sceneKey(), mode, ghost, explode, highlight, pickA),
+            GlViewport(Modifier.fillMaxSize(), camera, key = listOf(if (demo) "demo" else st.sceneKey(), mode, ghost, explode, highlight, pickA, hyps.map { it.key }, focusHyp),
                 autoRotate = st.selected < 0 && pickA < 0, clipY = clipY, clipX = clipX,
                 onTap = { id ->
                     if (demo) return@GlViewport
@@ -334,6 +367,9 @@ fun ModelScreen(st: ScanState) {
                 Layout.draw(s, shown, highlight,
                     colorOf = { pl -> if (mode == Mode.CONFIANCA) assess[pl.piece.id]?.level?.argb ?: pl.piece.color else if (mode == Mode.MEDIR && pl.piece.id == pickA) 0xFF7FD6FF.toInt() else pl.piece.color },
                     ghostOf = { pl -> if (mode == Mode.RAIOX && (ghost || (st.selected >= 0 && pl.piece.id != st.selected))) .18f else 1f })
+                // hipóteses: cinza e transparentes (amarelas quando em foco) — nunca parecem peça vista
+                for (h in hyps) for (hp in h.pieces) com.brastoy.brascan.three.TileMesh.build(s, hp.shape, hp.size, hp.center, hp.u, hp.v, hp.edge,
+                    Color(if (h.key == focusHyp) 0xFFFFC531.toInt() else Level.CINZA.argb), -1, false, shadow = false, ghost = if (h.key == focusHyp) .55f else .28f)
             }
             Column(Modifier.padding(14.dp).align(Alignment.TopStart)) {
                 Text(if (demo) "Exemplo" else "Seu modelo", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 20.sp)
@@ -341,7 +377,7 @@ fun ModelScreen(st: ScanState) {
                     demo -> "Escaneie uma foto na aba Scanner para ver o seu em 3D"
                     mode == Mode.MEDIR -> "Toque em duas peças para medir entre elas"
                     mode == Mode.CONFIANCA -> "Toque numa peça para ver o porquê da cor"
-                    mode == Mode.RAIOX -> "Visualização: não enxerga através de paredes reais"
+                    mode == Mode.RAIOX -> "Visualização: não enxerga através de paredes reais" + if (hyps.isNotEmpty()) " · ${hyps.size} hipóteses em cinza" else ""
                     else -> "${st.pieces.size} peças · toque numa peça para editar"
                 }, color = Palette.muted, fontSize = 12.sp)
             }
@@ -357,7 +393,7 @@ fun ModelScreen(st: ScanState) {
                 Mode.MODELO -> if (sel == null) ExportPanel(st, demo) else PieceEditor(st, sel)
                 Mode.CONFIANCA -> ConfidencePanel(st, sel, assess, demo)
                 Mode.MEDIR -> MeasurePanel(mpieces, pickA, pickB)
-                Mode.RAIOX -> Column {
+                Mode.RAIOX -> Column(Modifier.heightIn(max = 340.dp).verticalScroll(rememberScrollState())) {
                     SliderRow("Corte de altura", cutY) { cutY = it }
                     SliderRow("Corte lateral", cutX) { cutX = it }
                     SliderRow("Explodir montagem", explode / 1.5f) { explode = it * 1.5f }
@@ -366,7 +402,30 @@ fun ModelScreen(st: ScanState) {
                         androidx.compose.material3.Switch(checked = ghost, onCheckedChange = { ghost = it })
                     }
                     Text(if (st.selected >= 0) "Peça isolada: as outras ficam transparentes. Toque fora para soltar." else "Toque numa peça para isolá-la.", color = Palette.muted, fontSize = 12.sp)
+                    HypothesesPanel(st, hyps, focusHyp) { focusHyp = it }
                 }
+            }
+        }
+    }
+}
+
+/** Partes não vistas: cada hipótese com motivo, peso relativo e decisão do usuário. */
+@Composable
+private fun HypothesesPanel(st: ScanState, hyps: List<Inference.Hypothesis>, focus: String?, onFocus: (String?) -> Unit) {
+    Text(if (hyps.isEmpty()) "Nenhuma parte escondida sugerida para este modelo." else "Partes não vistas (hipóteses, em cinza no 3D):",
+        color = Palette.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
+    Column {
+        for ((g, alts) in hyps.groupBy { it.group }) {
+            if (alts.size > 1) Text("Alternativas (só uma pode valer):", color = Color(0xFFFFC531), fontSize = 11.sp, modifier = Modifier.padding(top = 6.dp))
+            for (h in alts) Row(Modifier.fillMaxWidth().padding(top = 4.dp).clip(RoundedCornerShape(10.dp))
+                .background(if (h.key == focus) Color(0x33FFC531) else Color.Transparent)
+                .pointerInput(h.key) { detectTapGestures { onFocus(if (focus == h.key) null else h.key) } }.padding(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("${h.title} · peso ${"%.0f".format(h.weight * 100)}", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    Text(h.reason + if (h.pieces.isNotEmpty()) " (${h.pieces.size} peça${if (h.pieces.size > 1) "s" else ""})" else "", color = Palette.muted, fontSize = 11.sp)
+                }
+                FilledTonalIconButton(onClick = { st.accept(h); onFocus(null) }, modifier = Modifier.size(36.dp)) { Icon(Icons.Rounded.Check, "Aceitar") }
+                FilledTonalIconButton(onClick = { st.reject(h); onFocus(null) }, modifier = Modifier.size(36.dp)) { Icon(Icons.Rounded.Close, "Rejeitar") }
             }
         }
     }
@@ -383,11 +442,19 @@ private fun ExportPanel(st: ScanState, demo: Boolean) {
     val ctx = LocalContext.current
     val scope = androidx.compose.runtime.rememberCoroutineScope()
     var b5 by remember { mutableStateOf<String?>(null) }
+    var experimental by remember { mutableStateOf(false) }
+    val hasHyp = st.pieces.any { it.evidence?.source == Evidence.Source.HIPOTESE }
+    // conservador: só o que foi visto/confirmado; experimental: inclui hipóteses que você aceitou
+    fun exported() = st.placed().filter { experimental || it.piece.evidence?.source != Evidence.Source.HIPOTESE }
+    if (hasHyp) Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(if (experimental) "Exportar com hipóteses aceitas (experimental)" else "Exportar só o que foi visto (conservador)", color = Color.White, fontSize = 13.sp, modifier = Modifier.weight(1f))
+        androidx.compose.material3.Switch(checked = experimental, onCheckedChange = { experimental = it })
+    }
     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         Button(enabled = !demo && b5 != "…", onClick = {
             b5 = "…"
             scope.launch {
-                when (val r = com.brastoy.brascan.scan.B5Export.encode(ctx, st.placed())) {
+                when (val r = com.brastoy.brascan.scan.B5Export.encode(ctx, exported())) {
                     is com.brastoy.brascan.scan.B5Export.Result.Ok -> {
                         (ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Brastoy", r.code))
                         b5 = "Copiado e conferido (reimportado sem diferença, erro máx. ${"%.1f".format(r.maxPosError * 75)} mm): ${r.pieces} peças\n${r.code}"
@@ -397,7 +464,7 @@ private fun ExportPanel(st: ScanState, demo: Boolean) {
             }
         }, modifier = Modifier.weight(1f)) { Icon(Icons.Rounded.ContentCopy, null); Spacer(Modifier.width(6.dp)); Text("Código B4/B5") }
         FilledTonalButton(enabled = !demo, onClick = {
-            ctx.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("application/json").putExtra(Intent.EXTRA_TEXT, Layout.json(Layout.exportReady(st.placed()))), "Enviar para o simulador"))
+            ctx.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("application/json").putExtra(Intent.EXTRA_TEXT, Layout.json(Layout.exportReady(exported()))), "Enviar para o simulador"))
         }, modifier = Modifier.weight(1f)) { Icon(Icons.Rounded.Share, null); Spacer(Modifier.width(6.dp)); Text("JSON") }
     }
     b5?.takeIf { it != "…" }?.let { Text(it, color = if (it.startsWith("Não")) Palette.pink else Palette.y, fontSize = 12.sp, maxLines = 6, modifier = Modifier.padding(top = 8.dp)) }

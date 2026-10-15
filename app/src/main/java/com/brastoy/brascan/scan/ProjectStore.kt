@@ -10,7 +10,7 @@ import org.json.JSONObject
 import java.io.File
 
 /** Um projeto salvo: peças (com evidências), como a foto foi tirada, a foto e o mapa do scanner 3D. */
-class Project(val name: String, val savedAt: Long, val vista: Vista, val pieces: List<Piece>, val slamMap: String?, val photo: Bitmap?, val pid: String = "")
+class Project(val name: String, val savedAt: Long, val vista: Vista, val pieces: List<Piece>, val slamMap: String?, val photo: Bitmap?, val pid: String = "", val rejected: List<String> = emptyList())
 
 /**
  * Projetos ficam em arquivos do próprio app (não precisa de permissão nem de internet).
@@ -26,7 +26,7 @@ class ProjectStore(ctx: Context) {
 
     fun save(id: String, p: Project) {
         val j = JSONObject().put("format", "BraScan-projeto").put("version", 1).put("name", p.name).put("savedAt", p.savedAt)
-            .put("pid", p.pid).put("vista", p.vista.name).put("pieces", JSONArray(p.pieces.map(::pieceJson)))
+            .put("pid", p.pid).put("rejected", JSONArray(p.rejected)).put("vista", p.vista.name).put("pieces", JSONArray(p.pieces.map(::pieceJson)))
         p.slamMap?.let { j.put("slamMap", it) }
         val photoFile = File(dir, "$id.jpg")
         if (p.photo != null) { photoFile.outputStream().use { p.photo.compress(Bitmap.CompressFormat.JPEG, 88, it) }; j.put("photo", photoFile.name) } else photoFile.delete()
@@ -38,7 +38,7 @@ class ProjectStore(ctx: Context) {
         val j = JSONObject(File(dir, "$id.json").readText())
         val photo = j.optString("photo").takeIf { it.isNotBlank() }?.let { BitmapFactory.decodeFile(File(dir, it).path) }
         val arr = j.getJSONArray("pieces")
-        Project(j.getString("name"), j.getLong("savedAt"), Vista.valueOf(j.optString("vista", "FRENTE")), List(arr.length()) { pieceFrom(arr.getJSONObject(it)) }, j.optString("slamMap").takeIf { it.isNotBlank() }, photo, j.optString("pid"))
+        Project(j.getString("name"), j.getLong("savedAt"), Vista.valueOf(j.optString("vista", "FRENTE")), List(arr.length()) { pieceFrom(arr.getJSONObject(it)) }, j.optString("slamMap").takeIf { it.isNotBlank() }, photo, j.optString("pid"), j.optJSONArray("rejected")?.let { a -> List(a.length()) { a.getString(it) } } ?: emptyList())
     }.getOrNull()
 
     fun delete(id: String) { File(dir, "$id.json").delete(); File(dir, "$id.jpg").delete() }
