@@ -78,8 +78,9 @@ object Updater {
     }
 
     private suspend fun install(ctx: Context, r: Remote) {
-        attempted = r.code
+        // Sem a permissão não conta como tentativa: ao voltar das configurações instala sozinho.
         if (!ctx.packageManager.canRequestPackageInstalls()) { state.value = State.NeedsPermission(r); return }
+        attempted = r.code
         val apk = try { download(ctx, r) } catch (e: Exception) { state.value = State.Failed("Falha no download: ${e.message}"); return }
         state.value = State.Installing(r)
         try {
