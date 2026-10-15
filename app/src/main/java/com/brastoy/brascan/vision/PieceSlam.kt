@@ -16,7 +16,7 @@ import kotlin.math.sqrt
  *
  * Mundo: Y para cima (gravidade do celular, quando houver), metros, origem na primeira peça vista.
  */
-class PieceSlam(private val k: Intrinsics) {
+class PieceSlam(private val k: Intrinsics, private val autoOptimize: Boolean = true) {
     /** Pose de uma detecção: candidatos peça→câmera (simetrias da peça dão vários com o mesmo erro). */
     /** [frontal]: 1 = vista de frente, 0 = de lado (peso do voto da forma). [outline]: 4 ou 3 cantos. */
     class Detection(val shape: String, val color: Int, val bin: Int, val candidates: List<Pose>, val rms: Double, val areaPx: Int,
@@ -41,6 +41,8 @@ class PieceSlam(private val k: Intrinsics) {
         var lastSeen = 0
         /** Vistas e incerteza herdadas de um mapa salvo (sessão anterior). */
         var baseCount = 0; var baseSpread = Double.NaN
+        /** Quadro-chave em que a peça apareceu pela primeira vez (rever peça antiga = fechar laço). */
+        var firstKf = -1
         /** De quais lados a peça já foi vista: 12 setores de 30° em volta (bits) e maior elevação (graus). */
         var sectors = 0; var maxElev = -90.0
         val count get() = baseCount + obs.count { !it.restored }
@@ -101,6 +103,17 @@ class PieceSlam(private val k: Intrinsics) {
     var lost = false; private set
     var frames = 0; private set
     var lastMatched = 0; private set
+    /** Quadro-chave: pose da câmera, gravidade e cantos medidos de cada peça (para o ajuste global). */
+    class Keyframe(var pose: Pose, val up: DoubleArray?, val obs: List<Pair<Int, PlanarObs>>)
+    /** Cantos do molde (m, tamanho grande) ↔ pixels; [scale] = tamanho da peça / grande. */
+    class PlanarObs(val model: List<DoubleArray>, val px: List<DoubleArray>, val sigma: Double)
+    val keyframes = ArrayList<Keyframe>()
+    /** Peça juntada em outra (duplicata): as observações antigas passam a valer para a que ficou. */
+    private val alias = HashMap<Int, Int>()
+    private fun resolve(id: Int): Int { var x = id; while (alias.containsKey(x)) x = alias.getValue(x); return x }
+    val baReports = ArrayList<BundleAdjust.Report>()
+    private var lastBaKf = 0
+
     /** Mapa veio de uma sessão salva e a câmera já se alinhou com ele. */
     var relocalized = false; private set
     val restoredMap get() = map.any { it.baseCount > 0 }
@@ -195,7 +208,8 @@ class PieceSlam(private val k: Intrinsics) {
         if (map.isEmpty()) {
             val c = Pose(alignUp(upCam), doubleArrayOf(0.0, 0.0, 0.0))
             camera = c; lost = false
-            for (d in dets) newPiece(d, c)
+            val first = dets.mapNotNull { d -> newPiece(d, c)?.let { mp -> mp to planarObs(d, d.candidates[0], outlineOf(d.shape)) } }
+            maybeKeyframe(c, upCam, first)
             return dets
         }
         // mapa salvo e câmera ainda desconhecida: relocalizar (só com consenso, nunca força alinhamento)
@@ -251,6 +265,15 @@ class PieceSlam(private val k: Intrinsics) {
             m.mp.add(Obs(cam.compose(scaled(cand, s)), cam.t.clone(), weight(m.det), m.det.candidatesFor(m.mp.shape).map { cam.compose(scaled(it, s)) })); m.mp.lastSeen = frames
             m.mp.votes.merge(m.det.shape, .05 + m.det.frontal * m.det.frontal, Double::plus); m.mp.update()
         }
+        maybeKeyframe(cam, upCam, inl.map { m ->
+            val s = Catalog.SCALE.getValue(m.mp.size).toDouble()
+            val cand = m.det.candidatesFor(m.mp.shape).minBy { c -> Rot.angle(cam.compose(scaled(c, s)).r, m.mp.pose.r) }
+            m.mp to planarObs(m.det, cand, outlineOf(m.mp.shape))
+        })
+        // laço: reviu peça que apareceu muitos quadros-chave atrás → ajuste global
+        val kfNow = keyframes.size - 1
+        if (autoOptimize && inl.any { it.mp.firstKf in 0..(kfNow - 8) } && kfNow - lastBaKf >= 4) optimize()
+        val born = ArrayList<Pair<MapPiece, PlanarObs>>()
         // as outras peças vistas: associadas ao mapa só pela posição (a orientação de triângulos é ambígua,
         // mas a posição não); acumulam observações e votam na orientação entre vistas
         for (d in dets) if (d !in takenDet) {
@@ -262,25 +285,130 @@ class PieceSlam(private val k: Intrinsics) {
             if (near != null && alts!!.minOf { dist(it.t, near.pose.t) } < Catalog.edgeM("grande") * .6) {
                 near.add(Obs(alts.minBy { Rot.angle(it.r, near.pose.r) }, cam.t.clone(), weight(d) * .5, alts)); near.lastSeen = frames
                 near.votes.merge(d.shape, .05 + d.frontal * d.frontal, Double::plus); near.update()
-            } else newPiece(d, cam)
+            } else newPiece(d, cam)?.let { mp -> born += mp to planarObs(d, d.candidates[0], outlineOf(d.shape)) }
         }
+        if (born.isNotEmpty()) { val kf = keyframes.lastOrNull(); maybeKeyframe(cam, upCam, born, force = kf == null || kf.pose !== cam) }
         mergeDuplicates()
         // detecção passageira (reflexo, peça cortada na borda): vista < 3 vezes e sumiu há 20 quadros → sai do mapa
         map.removeAll { it.count < 3 && it.baseCount == 0 && frames - it.lastSeen > 20 }
         return dets
     }
 
-    private fun newPiece(d: Detection, cam: Pose) {
+    private fun newPiece(d: Detection, cam: Pose): MapPiece? {
         // peça nova nascendo em cima de uma já mapeada (ex.: escala errada): não duplica
         val w = cam.compose(d.candidates[0])
-        if (map.any { it.outline == d.outline && it.bin == d.bin && dist(it.pose.t, w.t) < Catalog.edgeM("grande") * .6 }) return
+        if (map.any { it.outline == d.outline && it.bin == d.bin && dist(it.pose.t, w.t) < Catalog.edgeM("grande") * .6 }) return null
         val mp = MapPiece(nextId++, d.shape, d.color, d.bin, d.outline)
+        mp.firstKf = keyframes.size
         mp.votes.merge(d.shape, .05 + d.frontal * d.frontal, Double::plus)
         mp.obs += Obs(w, cam.t.clone(), weight(d), d.candidates.map { cam.compose(it) }); mp.lastSeen = frames; mp.update(); mp.noteView(cam.t); map += mp
+        return mp
+    }
+
+    /** Cantos do molde ↔ cantos medidos, na ordem dada pela pose escolhida (simetria coerente com o mapa). */
+    private fun planarObs(d: Detection, cand: Pose, outlineShape: String): PlanarObs {
+        val model = modelCorners(outlineShape)
+        val px = model.map { x -> val q = PlanarPose.project(cand, x, k); d.imgCorners.minBy { (it[0] - q[0]) * (it[0] - q[0]) + (it[1] - q[1]) * (it[1] - q[1]) } }
+        return PlanarObs(model, px, 1.0 + d.rms)
+    }
+
+    /** Novo quadro-chave quando a câmera andou ≥ 5 cm ou girou ≥ 10° (no máximo 40: os do meio são rareados). */
+    private fun maybeKeyframe(cam: Pose, up: DoubleArray?, obs: List<Pair<MapPiece, PlanarObs>>, force: Boolean = false) {
+        val last = keyframes.lastOrNull()
+        // peça que ainda não está em nenhum quadro-chave força um: senão ela ficaria fora do ajuste global
+        val newcomer = force || obs.any { it.first.firstKf < 0 }
+        if (!newcomer && last != null && dist(last.pose.t, cam.t) < .05 && Rot.angle(last.pose.r, cam.r) < Math.toRadians(10.0)) return
+        keyframes += Keyframe(cam, up?.clone(), obs.map { (mp, o) -> mp.id to o })
+        for ((mp, _) in obs) if (mp.firstKf < 0) mp.firstKf = keyframes.size - 1
+        if (keyframes.size > 40) { keyframes.removeAt(keyframes.size / 2); lastBaKf = (lastBaKf - 1).coerceAtLeast(0) } // os mais antigos ancoram o laço; 40 mantém o ajuste rápido no celular
+    }
+
+    /**
+     * Ajuste global: câmeras dos quadros-chave + peças. As peças passam a valer a pose otimizada
+     * (as observações antigas viram um resumo com o mesmo peso) e a câmera atual acompanha a correção.
+     */
+    fun optimize(): BundleAdjust.Report? {
+        val first = optimizeOnce() ?: return null
+        if (!first.accepted) return first
+        // depois do ajuste, cópias da mesma peça (criadas durante a deriva) ficam juntas: junta e ajusta de novo
+        return if (mergeDuplicates() > 0) optimizeOnce() ?: first else first
+    }
+
+    private fun optimizeOnce(): BundleAdjust.Report? {
+        if (keyframes.size < 3) return null
+        // triângulos ficam de fora: com 3 cantos a correspondência pode cair na pose espelhada
+        val ids = keyframes.flatMap { kf -> kf.obs.map { resolve(it.first) } }.distinct()
+            .filter { id -> map.any { it.id == id && it.outline == 4 } }
+        val idx = ids.withIndex().associate { (i, id) -> id to i }
+        val mps = ids.map { id -> map.first { it.id == id } }
+        /** Observações para o ajuste a partir das poses ATUAIS (correspondência dos cantos e corte de associação refeitos). */
+        fun buildObs(cs: List<Pose>, ps: List<Pose>) = keyframes.indices.flatMap { ki -> keyframes[ki].obs.mapNotNull { (id, o) ->
+            val pi = idx[resolve(id)] ?: return@mapNotNull null
+            if (o.model.size != 4) return@mapNotNull null
+            val sc = Catalog.SCALE.getValue(mps[pi].size).toDouble()
+            val toCam = cs[ki].inverse().compose(ps[pi])
+            if (toCam.t[2] < .03) return@mapNotNull null // peça atrás da câmera: associação errada
+            // peças simétricas: a ordem dos cantos segue a pose atual
+            val model = o.model.map { doubleArrayOf(it[0] * sc, it[1] * sc) }
+            val pred = model.map { PlanarPose.project(toCam, it, k) }
+            val free = o.px.toMutableList(); var sum = 0.0
+            val px = pred.map { q -> val best = free.minBy { (it[0] - q[0]) * (it[0] - q[0]) + (it[1] - q[1]) * (it[1] - q[1]) }; free.remove(best)
+                sum += sqrt((best[0] - q[0]) * (best[0] - q[0]) + (best[1] - q[1]) * (best[1] - q[1])); best }
+            if (sum / px.size > 25) return@mapNotNull null // longe demais (por enquanto): pode entrar na próxima rodada
+            BundleAdjust.Obs(ki, pi, model, px, o.sigma)
+        } }
+        val cams = keyframes.map { it.pose }.toMutableList(); val pcs = mps.map { it.pose }.toMutableList()
+        val lastOld = cams.last()
+        // reassociação iterativa: cada rodada aproxima as poses e deixa entrar observações do laço que estavam longe
+        var rep0: BundleAdjust.Report? = null; var used = 0; var firstRms = Double.NaN
+        for (round in 0 until 3) {
+            val obs = buildObs(cams, pcs)
+            if (obs.size < 6) break
+            if (rep0 != null && obs.size <= used) break // nada novo entrou
+            used = obs.size
+            val r = BundleAdjust.run(k, cams, keyframes.map { it.up }, pcs, obs)
+            if (firstRms.isNaN()) firstRms = r.rmsBefore
+            rep0 = BundleAdjust.Report(r.iterations, firstRms, r.rmsAfter, r.outliers)
+        }
+        if (rep0 == null || mps.isEmpty()) return null
+        // aceita só se a reprojeção não piorou e nada saltou de forma impossível
+        val jumpP = pcs.indices.maxOf { dist(pcs[it].t, mps[it].pose.t) }
+        val jumpC = cams.indices.maxOf { dist(cams[it].t, keyframes[it].pose.t) }
+        val turn = cams.indices.maxOf { Rot.angle(cams[it].r, keyframes[it].pose.r) }
+        val ok = rep0.rmsAfter.isFinite() && rep0.rmsAfter <= rep0.rmsBefore * 1.05 + .1 && jumpP < .25 && jumpC < .25 && turn < Math.toRadians(30.0)
+        if (!ok) {
+            val rej = BundleAdjust.Report(rep0.iterations, rep0.rmsBefore, rep0.rmsAfter, rep0.outliers, accepted = false,
+                note = "descartado: reprojeção %.1f→%.1f px, salto %.0f cm".format(rep0.rmsBefore, rep0.rmsAfter, maxOf(jumpP, jumpC) * 100))
+            lastBaKf = keyframes.size - 1; baReports += rej
+            return rej
+        }
+        val rep = rep0
+        // peças fora do ajuste (triângulos): recebem a correção do último quadro-chave que as viu
+        val inBa = mps.toSet()
+        // cada observação recebe a correção do quadro-chave cuja câmera estava mais perto de onde ela foi feita
+        val corrs = keyframes.indices.map { cams[it].compose(keyframes[it].pose.inverse()) }
+        fun corrAt(c: DoubleArray) = corrs[keyframes.indices.minBy { dist(keyframes[it].pose.t, c) }]
+        for (mp in map) if (mp !in inBa) {
+            if (mp.obs.isEmpty()) continue
+            val moved = mp.obs.map { o -> val corr = corrAt(o.camCenter); Obs(corr.compose(o.world), corr.apply(o.camCenter), o.weight, o.alts.map { corr.compose(it) }, o.restored) }
+            mp.obs.clear(); mp.obs.addAll(moved); mp.update()
+        }
+        for (i in keyframes.indices) keyframes[i].pose = cams[i]
+        for ((i, mp) in mps.withIndex()) {
+            mp.baseCount += mp.obs.count { !it.restored }; mp.obs.clear()
+            mp.pose = pcs[i]
+            val nrm = mp.pose.col(2)
+            mp.obs += Obs(mp.pose, DoubleArray(3) { mp.pose.t[it] + nrm[it] * .35 }, maxOf(1, mp.baseCount).toDouble(), listOf(mp.pose), restored = true)
+        }
+        // câmera atual: mesma correção do último quadro-chave
+        camera?.let { c -> camera = cams.last().compose(lastOld.inverse()).compose(c) }
+        lastBaKf = keyframes.size - 1; baReports += rep
+        return rep
     }
 
     /** Mesma peça mapeada duas vezes (associação perdida num quadro): junta as observações. */
-    private fun mergeDuplicates() {
+    private fun mergeDuplicates(): Int {
+        val before = map.size
         var i = 0
         while (i < map.size) {
             val a = map[i]; var j = i + 1
@@ -290,11 +418,13 @@ class PieceSlam(private val k: Intrinsics) {
                 val sameNormal = abs(na[0] * nb[0] + na[1] * nb[1] + na[2] * nb[2]) > .82
                 if (a.outline == b.outline && a.bin == b.bin && sameNormal && dist(a.pose.t, b.pose.t) < Catalog.edgeM("grande") * .85) {
                     a.obs += b.obs; a.baseCount += b.baseCount; a.sectors = a.sectors or b.sectors; a.maxElev = max(a.maxElev, b.maxElev)
+                    alias[b.id] = a.id; if (b.firstKf in 0 until a.firstKf || a.firstKf < 0) a.firstKf = b.firstKf
                     b.votes.forEach { (sh, v) -> a.votes.merge(sh, v, Double::plus) }; a.update(); map.removeAt(j)
                 } else j++
             }
             i++
         }
+        return before - map.size
     }
 
     private fun weight(d: Detection) = sqrt(d.areaPx.toDouble()) / (1 + d.rms)

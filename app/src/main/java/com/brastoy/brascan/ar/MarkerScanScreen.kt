@@ -88,6 +88,9 @@ data class MarkerStatus(
     val target: Offset? = null,
     val advice: List<String> = emptyList(),
     val resuming: Boolean = false,
+    /** Ajustes globais aceitos (laços fechados) e o erro de reprojeção depois do último. */
+    val loops: Int = 0,
+    val reprojPx: Double = Double.NaN,
 )
 
 /**
@@ -135,13 +138,14 @@ fun MarkerScanScreen(initialMap: String? = null, onClose: () -> Unit, onDone: (L
                     Text(if (!permission) "Permita o uso da câmera" else status.advice.firstOrNull() ?: status.hint, color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
                     status.advice.drop(1).forEach { Text("· $it", color = Color(0xFFC9D6EA), fontSize = 12.sp) }
                     Text("Sem Google/ARCore · peças como marcadores · ${status.mapped} no mapa · ${"%.0f".format(status.fps)} quadros/s" +
+                        (if (status.loops > 0) " · ${status.loops} laços fechados (%.1f px)".format(status.reprojPx) else "") +
                         (if (status.gravity) "" else " · sem sensor de gravidade"), color = Palette.muted, fontSize = 12.sp)
                 }
             }
         }
         Row(Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(16.dp).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             FilledTonalButton(onClick = { engine.reset() }, modifier = Modifier.height(54.dp)) { Icon(Icons.Rounded.Refresh, null); Spacer(Modifier.width(6.dp)); Text(if (status.resuming) "Ignorar salvo" else "Recomeçar") }
-            Button(enabled = status.pieces.isNotEmpty(), onClick = { onDone(status.pieces, engine.exportMap()) }, modifier = Modifier.weight(1f).height(54.dp)) {
+            Button(enabled = status.pieces.isNotEmpty(), onClick = { engine.finish()?.let { (ps, map) -> onDone(ps, map) } ?: onDone(status.pieces, engine.exportMap()) }, modifier = Modifier.weight(1f).height(54.dp)) {
                 Icon(Icons.Rounded.ViewInAr, null); Spacer(Modifier.width(8.dp)); Text("Usar no 3D (${status.pieces.size})", fontWeight = FontWeight.Bold)
             }
         }
@@ -169,6 +173,9 @@ private class Engine(private val ctx: Context, private var initialMap: String?, 
     fun stop() { sm.unregisterListener(this); provider?.unbindAll(); exec.shutdown() }
     /** Recomeçar do zero (também serve para ignorar um mapa salvo que não está batendo). */
     fun reset() { exec.execute { initialMap = null; slam = intr?.let { PieceSlam(it) } } }
+
+    /** Ajuste global final + peças + mapa, na thread de análise (não cruza com o rastreio). */
+    fun finish(): Pair<List<Piece3D>, String>? = runCatching { exec.submit<Pair<List<Piece3D>, String>?> { slam?.let { it.optimize(); it.pieces() to it.export() } }.get() }.getOrNull()
 
     /** Mapa atual em texto (lido na thread de análise para não cruzar com o rastreio). */
     fun exportMap(): String? = runCatching { exec.submit<String?> { slam?.export() }.get() }.getOrNull()
@@ -256,6 +263,7 @@ private class Engine(private val ctx: Context, private var initialMap: String?, 
             else -> "${pieces.size} peças no modelo — mostre os outros lados para refinar"
         }
         publish(MarkerStatus(hint, !s.lost, s.map.size, pieces, dets.map { d -> d.imgCorners.map { upright(it[0], it[1]) } to d.color }, uw, uh, fps, up != null,
-            target, adv.map { it.text }, s.restoredMap && !s.relocalized))
+            target, adv.map { it.text }, s.restoredMap && !s.relocalized,
+            s.baReports.count { it.accepted }, s.baReports.lastOrNull { it.accepted }?.rmsAfter ?: Double.NaN))
     }
 }
