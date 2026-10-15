@@ -13,7 +13,17 @@ import kotlin.math.min
 object TileMesh {
     private fun mix(a: Color, b: Color, t: Float) = Color(a.red + (b.red - a.red) * t, a.green + (b.green - a.green) * t, a.blue + (b.blue - a.blue) * t, 1f)
 
-    fun build(s: Scene, shape: String, size: String, center: V3, u: V3, v: V3, edge: Float, color: Color, tag: Int, selected: Boolean, shadow: Boolean = true) {
+    /** [ghost] < 1 deixa a peça transparente (Raio-X: paredes fantasma / isolar uma peça). */
+    fun build(s: Scene, shape: String, size: String, center: V3, u: V3, v: V3, edge: Float, color: Color, tag: Int, selected: Boolean, shadow: Boolean = true, ghost: Float = 1f) {
+        val first = s.faces.size; val firstLine = s.lines.size
+        buildInner(s, shape, size, center, u, v, edge, color, tag, selected, shadow)
+        if (ghost < 1f) {
+            for (i in first until s.faces.size) { val f = s.faces[i]; s.faces[i] = Face(f.pts, f.color, (f.alpha * ghost).coerceAtMost(.98f), f.tag, f.doubleSided, f.outline, f.unlit) }
+            for (i in firstLine until s.lines.size) { val l = s.lines[i]; s.lines[i] = Line3(l.a, l.b, l.color.copy(alpha = l.color.alpha * (.4f + .6f * ghost)), l.width) }
+        }
+    }
+
+    private fun buildInner(s: Scene, shape: String, size: String, center: V3, u: V3, v: V3, edge: Float, color: Color, tag: Int, selected: Boolean, shadow: Boolean) {
         val n = u.cross(v).norm()
         val t = Catalog.thickness(size, edge)
         fun P(a: Float, b: Float, z: Float) = center + u * (a * edge) + v * (b * edge) + n * z

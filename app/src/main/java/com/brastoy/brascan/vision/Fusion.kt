@@ -15,6 +15,9 @@ data class Piece3D(
     val u: V3, val v: V3, val n: V3,
     val w: Float, val h: Float,
     val support: Int,
+    /** Espalhamento das posições observadas (m) e fração dos votos para a forma escolhida — viram confiança. */
+    val spreadM: Double = Double.NaN,
+    val shapeShare: Float = Float.NaN,
 )
 
 object Pca {

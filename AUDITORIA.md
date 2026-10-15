@@ -58,9 +58,9 @@ fotos reais das peças enviadas pelo usuário. **Não há celular físico aqui**
 | 7 GPS / Wi-Fi RTT / BLE | ⬜ (auxiliar; não afeta posição de peça) |
 | 8 Âncoras persistentes / retomada | ⬜ |
 | 9 Inferência de interiores | ⬜ |
-| 10 Mapa de confiança | 🟠 IoU do molde e suporte de voxels já calculados; falta exibir |
+| 10 Mapa de confiança | ✅ (emulador) verde/amarelo/vermelho/cinza por evidência medida (vistas, espalhamento, IoU do molde, votos de forma, empurrão da colisão, confirmação) com lista de motivos; `ConfidenceMeasureTest` |
 | 11 Active scanning | 🟠 cobertura em 12 setores + dicas simples |
-| 12 Medições e Raio-X | ⬜ |
+| 12 Medições e Raio-X | ✅ (emulador) altura/largura/profundidade/volume/inclinação e distância entre peças, cada uma marcada como observada/derivada/estimada com ± quando medível; escala explícita em foto (grande = 7,5 cm). Raio-X: corte horizontal e lateral no shader, paredes fantasma, isolar peça, explosão. Medição contra objeto físico de tamanho conhecido: **não feita** (sem régua) |
 | 13 B5 validado | ✅ exportação conservadora; modo experimental depende das hipóteses (fase 9) |
 | 14 Atualizações GitHub | ✅ |
 | 15 Otimização e testes físicos | ⛔ depende de celular físico |

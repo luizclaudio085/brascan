@@ -29,6 +29,9 @@ class GlSceneRenderer {
     private var preparedFor: Scene? = null
     private var prepared: Prepared? = null
     private var scratch = FloatArray(0)
+    /** Raio-X: só desenha o que estiver abaixo de [clipY] e à esquerda de [clipX] (unidades da cena). */
+    @Volatile var clipY = 9000f
+    @Volatile var clipX = 9000f
 
     fun init() {
         mesh = program(
@@ -38,9 +41,10 @@ class GlSceneRenderer {
             void main(){ vNor=aNor; vCol=aCol; vPos=aPos; gl_Position=uMVP*vec4(aPos,1.0); }
             """,
             """
-            precision mediump float; uniform vec3 uLight; uniform vec3 uLight2; uniform vec3 uEye;
+            precision mediump float; uniform vec3 uLight; uniform vec3 uLight2; uniform vec3 uEye; uniform vec2 uClip;
             varying vec3 vNor; varying vec4 vCol; varying vec3 vPos;
             void main(){
+              if(vPos.y>uClip.x||vPos.x>uClip.y) discard; // Raio-X: corte horizontal / vertical
               vec3 n=normalize(vNor); vec3 e=normalize(uEye-vPos); if(dot(n,e)<0.0) n=-n;
               vec3 l=normalize(uLight); vec3 h=normalize(l+e);
               float d=max(dot(n,l),0.0); float d2=max(dot(n,normalize(uLight2)),0.0)*0.30;
@@ -55,10 +59,10 @@ class GlSceneRenderer {
         )
         flat = program(
             """
-            uniform mat4 uMVP; uniform float uSize; attribute vec3 aPos; attribute vec4 aCol; varying vec4 vCol;
-            void main(){ vCol=aCol; gl_Position=uMVP*vec4(aPos,1.0); gl_PointSize=uSize; }
+            uniform mat4 uMVP; uniform float uSize; attribute vec3 aPos; attribute vec4 aCol; varying vec4 vCol; varying vec3 vPos;
+            void main(){ vCol=aCol; vPos=aPos; gl_Position=uMVP*vec4(aPos,1.0); gl_PointSize=uSize; }
             """,
-            "precision mediump float; varying vec4 vCol; void main(){ gl_FragColor=vCol; }",
+            "precision mediump float; uniform vec2 uClip; varying vec4 vCol; varying vec3 vPos; void main(){ if(vPos.y>uClip.x||vPos.x>uClip.y) discard; gl_FragColor=vCol; }",
         )
     }
 
@@ -144,7 +148,9 @@ class GlSceneRenderer {
         val d = floatArrayOf(-1f, -1f, 0f, *b, 1f, -1f, 0f, *b, 1f, 1f, 0f, *t, -1f, -1f, 0f, *b, 1f, 1f, 0f, *t, -1f, 1f, 0f, *t)
         Matrix.setIdentityM(mvp, 0)
         GLES20.glDisable(GLES20.GL_DEPTH_TEST)
+        val cy = clipY; val cx = clipX; clipY = 9000f; clipX = 9000f // o fundo nunca é cortado
         flatDraw(d, GLES20.GL_TRIANGLES, 1f)
+        clipY = cy; clipX = cx
     }
 
     private fun upload(d: FloatArray, n: Int): FloatBuffer {
@@ -160,6 +166,7 @@ class GlSceneRenderer {
         GLES20.glUniform3f(GLES20.glGetUniformLocation(mesh, "uLight"), -.45f, .85f, .35f)
         GLES20.glUniform3f(GLES20.glGetUniformLocation(mesh, "uLight2"), .6f, .3f, -.5f)
         GLES20.glUniform3f(GLES20.glGetUniformLocation(mesh, "uEye"), eye.x, eye.y, eye.z)
+        GLES20.glUniform2f(GLES20.glGetUniformLocation(mesh, "uClip"), clipY, clipX)
         val fb = upload(data, n)
         attr(mesh, "aPos", fb, 0, 3, 40); attr(mesh, "aNor", fb, 3, 3, 40); attr(mesh, "aCol", fb, 6, 4, 40)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, n / 10)
@@ -170,6 +177,7 @@ class GlSceneRenderer {
         GLES20.glUseProgram(flat)
         GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(flat, "uMVP"), 1, false, mvp, 0)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(flat, "uSize"), size)
+        GLES20.glUniform2f(GLES20.glGetUniformLocation(flat, "uClip"), clipY, clipX)
         val fb = upload(d, d.size)
         attr(flat, "aPos", fb, 0, 3, 28); attr(flat, "aCol", fb, 3, 4, 28)
         GLES20.glDrawArrays(mode, 0, d.size / 7)

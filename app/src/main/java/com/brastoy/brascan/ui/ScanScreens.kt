@@ -89,6 +89,12 @@ import com.brastoy.brascan.scan.SHAPES
 import com.brastoy.brascan.scan.SHAPE_LABEL
 import com.brastoy.brascan.scan.SIZES
 import com.brastoy.brascan.scan.Vista
+import com.brastoy.brascan.vision.Assessment
+import com.brastoy.brascan.vision.Catalog
+import com.brastoy.brascan.vision.Confidence
+import com.brastoy.brascan.vision.Evidence
+import com.brastoy.brascan.vision.Level
+import com.brastoy.brascan.vision.Measure
 import com.brastoy.brascan.three.Camera
 import com.brastoy.brascan.three.V3
 import com.brastoy.brascan.three.GlViewport
@@ -124,7 +130,11 @@ class ScanState {
         image = null; selected = -1; pieces.clear()
         val list = Layout.fromScan(found, nextId); nextId += list.size; pieces.addAll(list)
     }
-    fun update(id: Int, f: (Piece) -> Piece) { val i = pieces.indexOfFirst { it.id == id }; if (i >= 0) pieces[i] = f(pieces[i]) }
+    /** Toda edição feita pelo usuário conta como confirmação da peça. */
+    fun update(id: Int, f: (Piece) -> Piece) {
+        val i = pieces.indexOfFirst { it.id == id }; if (i < 0) return
+        val np = f(pieces[i]); pieces[i] = np.copy(evidence = (np.evidence ?: com.brastoy.brascan.vision.Evidence(com.brastoy.brascan.vision.Evidence.Source.MANUAL)).copy(accepted = true))
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -232,7 +242,7 @@ private fun PhotoMarker(st: ScanState) {
                 if (hit != null) st.pieces.remove(hit) else {
                     val side = st.pieces.map { min(it.w, it.h) }.sorted().getOrNull(st.pieces.size / 2) ?: .12f
                     val px = img.getPixel((x * img.width).toInt().coerceIn(0, img.width - 1), (y * img.height).toInt().coerceIn(0, img.height - 1))
-                    st.pieces.add(Piece(st.newId(), x, y, side * img.height / img.width, side, st.shape, color = px))
+                    st.pieces.add(Piece(st.newId(), x, y, side * img.height / img.width, side, st.shape, color = px, evidence = com.brastoy.brascan.vision.Evidence(com.brastoy.brascan.vision.Evidence.Source.MANUAL)))
                 }
             }
         }) {
@@ -248,6 +258,8 @@ private fun PhotoMarker(st: ScanState) {
 }
 
 /** Modelo 3D editável: toque numa peça para selecionar e ajustar. */
+private enum class Mode(val label: String) { MODELO("Modelo"), CONFIANCA("Confiança"), MEDIR("Medir"), RAIOX("Raio-X") }
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ModelScreen(st: ScanState) {
@@ -255,6 +267,13 @@ fun ModelScreen(st: ScanState) {
     val camera = remember { Camera(yaw = .35f, pitch = .3f, distance = 5f, target = V3(0f, .5f, 0f)) }
     val demo = st.pieces.isEmpty()
     val demoPlaced = remember { Layout.solve(demoModel(), -1) }
+    var mode by remember { mutableStateOf(Mode.MODELO) }
+    var pickA by remember { mutableIntStateOf(-1) }; var pickB by remember { mutableIntStateOf(-1) }
+    var cutY by remember { androidx.compose.runtime.mutableFloatStateOf(1f) }
+    var cutX by remember { androidx.compose.runtime.mutableFloatStateOf(1f) }
+    var ghost by remember { mutableStateOf(false) }
+    var explode by remember { androidx.compose.runtime.mutableFloatStateOf(0f) }
+
     // Enquadra a câmera no tamanho do modelo sempre que ele muda.
     androidx.compose.runtime.LaunchedEffect(st.pieces.size, st.vista) {
         val pts = (if (demo) demoPlaced else st.placed()).map { it.center }
@@ -263,46 +282,141 @@ fun ModelScreen(st: ScanState) {
         val r = pts.maxOf { (it - c).len() } + .8f
         camera.target = c; camera.distance = (r * 2.6f).coerceIn(3f, 30f)
     }
+
+    val placed = if (demo) demoPlaced else st.placed()
+    val viewName = if (st.vista == Vista.CIMA) "cima" else "frente"
+    fun evidenceOf(pl: Placed) = if (demo) null else pl.piece.evidence?.let { if (it.source == Evidence.Source.FOTO) it.copy(view = viewName) else it }
+    val assess = placed.associate { it.piece.id to Confidence.assess(evidenceOf(it), (it.pushed * Catalog.SIDE_M).toDouble(), (it.edge * Catalog.SIDE_M).toDouble()) }
+    val mpieces = placed.map { Measure.P(it.piece.id, it.piece.shape, it.piece.size, it.center, it.u, it.v, it.edge, evidenceOf(it)) }
+
+    // Raio-X: explosão (só visual) e cortes
+    val c0 = if (placed.isEmpty()) V3.ZERO else placed.fold(V3.ZERO) { acc, p -> acc + p.center } * (1f / placed.size)
+    val shown = if (mode == Mode.RAIOX && explode > 0f) placed.map { it.copy(center = c0 + (it.center - c0) * (1f + explode)) } else placed
+    val yMax = (shown.maxOfOrNull { it.center.y + it.edge } ?: 1f); val xMin = shown.minOfOrNull { it.center.x - it.edge } ?: -1f; val xMax = shown.maxOfOrNull { it.center.x + it.edge } ?: 1f
+    val clipY = if (mode == Mode.RAIOX && cutY < .999f) yMax * cutY else 9000f
+    val clipX = if (mode == Mode.RAIOX && cutX < .999f) xMin + (xMax - xMin) * cutX else 9000f
+    val highlight = when (mode) { Mode.MEDIR -> if (pickB >= 0) pickB else pickA; else -> st.selected }
+
     Column(Modifier.fillMaxSize()) {
         Box(Modifier.fillMaxWidth().weight(1f)) {
-            GlViewport(Modifier.fillMaxSize(), camera, key = if (demo) "demo" else st.sceneKey(), autoRotate = st.selected < 0, onTap = { if (!demo) st.selected = it }) { s ->
+            GlViewport(Modifier.fillMaxSize(), camera, key = listOf(if (demo) "demo" else st.sceneKey(), mode, ghost, explode, highlight, pickA),
+                autoRotate = st.selected < 0 && pickA < 0, clipY = clipY, clipX = clipX,
+                onTap = { id ->
+                    if (demo) return@GlViewport
+                    when (mode) {
+                        Mode.MEDIR -> if (id < 0) { pickA = -1; pickB = -1 } else if (pickA < 0 || pickB >= 0) { pickA = id; pickB = -1 } else if (id != pickA) pickB = id
+                        else -> st.selected = id
+                    }
+                }) { s ->
                 s.floorGrid(8, .5f)
-                val placed = if (demo) demoPlaced else st.placed()
-                Layout.draw(s, placed, st.selected)
+                Layout.draw(s, shown, highlight,
+                    colorOf = { pl -> if (mode == Mode.CONFIANCA) assess[pl.piece.id]?.level?.argb ?: pl.piece.color else if (mode == Mode.MEDIR && pl.piece.id == pickA) 0xFF7FD6FF.toInt() else pl.piece.color },
+                    ghostOf = { pl -> if (mode == Mode.RAIOX && (ghost || (st.selected >= 0 && pl.piece.id != st.selected))) .18f else 1f })
             }
             Column(Modifier.padding(14.dp).align(Alignment.TopStart)) {
                 Text(if (demo) "Exemplo" else "Seu modelo", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 20.sp)
-                Text(if (demo) "Escaneie uma foto na aba Scanner para ver o seu em 3D" else "${st.pieces.size} peças · toque numa peça para editar",
-                    color = Palette.muted, fontSize = 12.sp)
+                Text(when {
+                    demo -> "Escaneie uma foto na aba Scanner para ver o seu em 3D"
+                    mode == Mode.MEDIR -> "Toque em duas peças para medir entre elas"
+                    mode == Mode.CONFIANCA -> "Toque numa peça para ver o porquê da cor"
+                    mode == Mode.RAIOX -> "Visualização: não enxerga através de paredes reais"
+                    else -> "${st.pieces.size} peças · toque numa peça para editar"
+                }, color = Palette.muted, fontSize = 12.sp)
             }
         }
         val sel = st.pieces.firstOrNull { it.id == st.selected }
         GlassCard(Modifier.fillMaxWidth().padding(12.dp)) {
-            if (sel == null) {
-                val scope = androidx.compose.runtime.rememberCoroutineScope()
-                var b5 by remember { mutableStateOf<String?>(null) }
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Button(enabled = !demo && b5 != "…", onClick = {
-                        b5 = "…"
-                        scope.launch {
-                            when (val r = com.brastoy.brascan.scan.B5Export.encode(ctx, st.placed())) {
-                                is com.brastoy.brascan.scan.B5Export.Result.Ok -> {
-                                    (ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Brastoy", r.code))
-                                    b5 = "Copiado e conferido (reimportado sem diferença, erro máx. ${"%.1f".format(r.maxPosError * 75)} mm): ${r.pieces} peças\n${r.code}"
-                                }
-                                is com.brastoy.brascan.scan.B5Export.Result.Failed -> b5 = "Não exportei: ${r.message}"
-                            }
-                        }
-                    }, modifier = Modifier.weight(1f)) { Icon(Icons.Rounded.ContentCopy, null); Spacer(Modifier.width(6.dp)); Text("Código B4/B5") }
-                    FilledTonalButton(enabled = !demo, onClick = {
-                        ctx.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("application/json").putExtra(Intent.EXTRA_TEXT, Layout.json(Layout.exportReady(st.placed()))), "Enviar para o simulador"))
-                    }, modifier = Modifier.weight(1f)) { Icon(Icons.Rounded.Share, null); Spacer(Modifier.width(6.dp)); Text("JSON") }
+            SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+                Mode.entries.forEachIndexed { i, m ->
+                    SegmentedButton(selected = mode == m, onClick = { mode = m; pickA = -1; pickB = -1 }, shape = SegmentedButtonDefaults.itemShape(i, Mode.entries.size)) { Text(m.label, fontSize = 12.sp, maxLines = 1) }
                 }
-                b5?.takeIf { it != "…" }?.let { Text(it, color = if (it.startsWith("Não")) Palette.pink else Palette.y, fontSize = 12.sp, maxLines = 6, modifier = Modifier.padding(top = 8.dp)) }
-                Text("Arraste: girar · pinça: zoom · toque duplo: recentralizar", color = Palette.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
-            } else PieceEditor(st, sel)
+            }
+            when (mode) {
+                Mode.MODELO -> if (sel == null) ExportPanel(st, demo) else PieceEditor(st, sel)
+                Mode.CONFIANCA -> ConfidencePanel(st, sel, assess, demo)
+                Mode.MEDIR -> MeasurePanel(mpieces, pickA, pickB)
+                Mode.RAIOX -> Column {
+                    SliderRow("Corte de altura", cutY) { cutY = it }
+                    SliderRow("Corte lateral", cutX) { cutX = it }
+                    SliderRow("Explodir montagem", explode / 1.5f) { explode = it * 1.5f }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Paredes fantasma", color = Color.White, modifier = Modifier.weight(1f))
+                        androidx.compose.material3.Switch(checked = ghost, onCheckedChange = { ghost = it })
+                    }
+                    Text(if (st.selected >= 0) "Peça isolada: as outras ficam transparentes. Toque fora para soltar." else "Toque numa peça para isolá-la.", color = Palette.muted, fontSize = 12.sp)
+                }
+            }
         }
     }
+}
+
+@Composable
+private fun SliderRow(label: String, value: Float, onChange: (Float) -> Unit) = Row(verticalAlignment = Alignment.CenterVertically) {
+    Text(label, color = Color.White, fontSize = 13.sp, modifier = Modifier.width(118.dp))
+    androidx.compose.material3.Slider(value = value, onValueChange = onChange, modifier = Modifier.weight(1f))
+}
+
+@Composable
+private fun ExportPanel(st: ScanState, demo: Boolean) {
+    val ctx = LocalContext.current
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    var b5 by remember { mutableStateOf<String?>(null) }
+    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        Button(enabled = !demo && b5 != "…", onClick = {
+            b5 = "…"
+            scope.launch {
+                when (val r = com.brastoy.brascan.scan.B5Export.encode(ctx, st.placed())) {
+                    is com.brastoy.brascan.scan.B5Export.Result.Ok -> {
+                        (ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Brastoy", r.code))
+                        b5 = "Copiado e conferido (reimportado sem diferença, erro máx. ${"%.1f".format(r.maxPosError * 75)} mm): ${r.pieces} peças\n${r.code}"
+                    }
+                    is com.brastoy.brascan.scan.B5Export.Result.Failed -> b5 = "Não exportei: ${r.message}"
+                }
+            }
+        }, modifier = Modifier.weight(1f)) { Icon(Icons.Rounded.ContentCopy, null); Spacer(Modifier.width(6.dp)); Text("Código B4/B5") }
+        FilledTonalButton(enabled = !demo, onClick = {
+            ctx.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("application/json").putExtra(Intent.EXTRA_TEXT, Layout.json(Layout.exportReady(st.placed()))), "Enviar para o simulador"))
+        }, modifier = Modifier.weight(1f)) { Icon(Icons.Rounded.Share, null); Spacer(Modifier.width(6.dp)); Text("JSON") }
+    }
+    b5?.takeIf { it != "…" }?.let { Text(it, color = if (it.startsWith("Não")) Palette.pink else Palette.y, fontSize = 12.sp, maxLines = 6, modifier = Modifier.padding(top = 8.dp)) }
+    Text("Arraste: girar · pinça: zoom · toque duplo: recentralizar", color = Palette.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
+}
+
+@Composable
+private fun ConfidencePanel(st: ScanState, sel: Piece?, assess: Map<Int, Assessment>, demo: Boolean) {
+    if (sel == null) {
+        val counts = assess.values.groupingBy { it.level }.eachCount()
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Level.entries.forEach { l ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.size(12.dp).clip(CircleShape).background(Color(l.argb)))
+                    Text(" ${counts[l] ?: 0}", color = Color.White, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+        Text("Verde: observada e validada · Amarelo: inferida/pouco confiável · Vermelho: conflito · Cinza: desconhecida", color = Palette.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp))
+        return
+    }
+    val a = assess[sel.id] ?: return
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.size(16.dp).clip(CircleShape).background(Color(a.level.argb)))
+        Text("  ${Catalog.LABEL[sel.shape]} · ${a.level.label}", color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+        if (!demo && sel.evidence?.accepted != true) FilledTonalButton(onClick = { st.update(sel.id) { it } }) { Text("Confirmar") }
+    }
+    a.reasons.forEach { Text("• $it", color = Color(0xFFC9D6EA), fontSize = 13.sp, modifier = Modifier.padding(top = 4.dp)) }
+}
+
+@Composable
+private fun MeasurePanel(ps: List<Measure.P>, a: Int, b: Int) {
+    val items = if (a >= 0 && b >= 0) Measure.between(ps.first { it.id == a }, ps.first { it.id == b }) else Measure.overall(ps)
+    Text(if (a >= 0 && b >= 0) "Entre as duas peças" else if (a >= 0) "Agora toque na segunda peça" else "Construção inteira", color = Palette.muted, fontSize = 12.sp)
+    for (m in items) Row(Modifier.padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(m.label, color = Color.White, fontSize = 13.sp, modifier = Modifier.weight(1f))
+        val v = if (m.unit == "cm³") "%.0f".format(m.value) else "%.1f".format(m.value)
+        Text("$v${m.plusMinus?.let { " ± %.1f".format(it) } ?: ""} ${m.unit}", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+        Text("  ${m.kind.label}", color = when (m.kind) { Measure.Kind.OBSERVADA -> Palette.y; Measure.Kind.DERIVADA -> Palette.accent; Measure.Kind.ESTIMADA -> Color(0xFFFFC531) }, fontSize = 11.sp)
+    }
+    items.firstOrNull { it.note.isNotBlank() }?.let { Text(it.note, color = Palette.muted, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp)) }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

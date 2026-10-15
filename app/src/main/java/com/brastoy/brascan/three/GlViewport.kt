@@ -40,6 +40,8 @@ class OrbitGlView(ctx: Context) : GLSurfaceView(ctx), GLSurfaceView.Renderer {
     var build: (Scene) -> Unit = {}
     /** A cena só é refeita quando a chave muda (peças, seleção…); girar a câmera não reconstrói nada. */
     @Volatile var key: Any? = Unit
+    @Volatile var clipY = 9000f
+    @Volatile var clipX = 9000f
     private var builtKey: Any? = null
     private var scene: Scene = Scene()
     var autoRotate = true
@@ -61,10 +63,11 @@ class OrbitGlView(ctx: Context) : GLSurfaceView(ctx), GLSurfaceView.Renderer {
 
     override fun onDrawFrame(g: GL10?) {
         val now = System.nanoTime()
-        if (last != 0L && autoRotate && System.currentTimeMillis() - lastTouch > 2500) camera.yaw += (now - last) / 1e9f * .25f
+        if (last != 0L && autoRotate && System.currentTimeMillis() - lastTouch > 2500) camera.yaw += (now - last) / 9000f * .25f
         last = now
         GLES20.glClearColor(.02f, .03f, .06f, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
+        gl.clipY = clipY; gl.clipX = clipX
         gl.background(0x0B1730, 0x04070E)
         val k = key
         if (k != builtKey || builtKey == null) { scene = Scene().also(build); builtKey = k ?: Any() }
@@ -81,7 +84,7 @@ class OrbitGlView(ctx: Context) : GLSurfaceView(ctx), GLSurfaceView.Renderer {
 }
 
 @Composable
-fun GlViewport(modifier: Modifier, camera: Camera, key: Any?, autoRotate: Boolean = true, onTap: ((Int) -> Unit)? = null, build: (Scene) -> Unit) {
+fun GlViewport(modifier: Modifier, camera: Camera, key: Any?, autoRotate: Boolean = true, clipY: Float = 9000f, clipX: Float = 9000f, onTap: ((Int) -> Unit)? = null, build: (Scene) -> Unit) {
     val buildState = rememberUpdatedState(build)
     val tapState = rememberUpdatedState(onTap)
     val home = remember { Triple(camera.yaw, camera.pitch, camera.distance) }
@@ -89,7 +92,7 @@ fun GlViewport(modifier: Modifier, camera: Camera, key: Any?, autoRotate: Boolea
     Box(modifier) {
         AndroidView(
             factory = { ctx -> OrbitGlView(ctx).also { it.camera = camera; ref[0] = it } },
-            update = { it.camera = camera; it.autoRotate = autoRotate; it.build = { s -> buildState.value(s) }; it.key = key; ref[0] = it },
+            update = { it.camera = camera; it.autoRotate = autoRotate; it.build = { s -> buildState.value(s) }; it.key = key; it.clipY = clipY; it.clipX = clipX; ref[0] = it },
             modifier = Modifier.fillMaxSize(),
         )
         Box(

@@ -76,7 +76,8 @@ class PieceSlam(private val k: Intrinsics) {
         /** Saída com restrição geométrica: em pé/deitada quando a medida está perto disso (Snap.basis). */
         fun toPiece3D(): Piece3D {
             val (u, v, n) = Snap.basis(v3(pose.col(0)), v3(pose.col(1)))
-            return Piece3D(shape, size, color, V3(pose.t[0].toFloat(), pose.t[1].toFloat(), pose.t[2].toFloat()), u, v, n, 0f, 0f, obs.size)
+            val share = (votes.maxOf { it.value } / votes.values.sum()).toFloat()
+            return Piece3D(shape, size, color, V3(pose.t[0].toFloat(), pose.t[1].toFloat(), pose.t[2].toFloat()), u, v, n, 0f, 0f, obs.size, spread, share)
         }
     }
 

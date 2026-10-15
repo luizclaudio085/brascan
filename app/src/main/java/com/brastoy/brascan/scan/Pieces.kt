@@ -7,6 +7,7 @@ import com.brastoy.brascan.three.Scene
 import com.brastoy.brascan.three.V3
 import com.brastoy.brascan.three.TileMesh
 import com.brastoy.brascan.vision.Collision
+import com.brastoy.brascan.vision.Evidence
 import com.brastoy.brascan.vision.Catalog
 import com.brastoy.brascan.vision.Piece3D
 import com.brastoy.brascan.vision.PhotoPieces
@@ -52,9 +53,12 @@ data class Piece(
     val spin: Float = 0f,
     val spinTop: Float = 0f,
     val pos: V3? = null, val pu: V3? = null, val pv: V3? = null,
+    /** De onde a peça veio e quanto foi observada (vira o mapa de confiança). */
+    val evidence: Evidence? = null,
 )
 
-data class Placed(val piece: Piece, val center: V3, val u: V3, val v: V3, val edge: Float) {
+/** [pushed]: quanto a colisão moveu a peça (unidades do modelo) — evidência de conflito. */
+data class Placed(val piece: Piece, val center: V3, val u: V3, val v: V3, val edge: Float, val pushed: Float = 0f) {
     val n get() = u.cross(v).norm()
     val orient: Orient get() = when { abs(n.y) > .7f -> Orient.DEITADA; abs(n.x) > abs(n.z) -> Orient.LADO; else -> Orient.FRENTE }
 }
@@ -111,14 +115,16 @@ object Layout {
         val floor = found.minOf { p -> outline(p.shape, Catalog.edgeM(p.size)).minOf { (a, b) -> (p.center + p.u * a + p.v * b).y } }
         return found.mapIndexed { i, p ->
             Piece(firstId + i, shape = p.shape, size = p.size, color = p.color,
-                pos = V3((p.center.x - cx) * MODEL_SCALE, (p.center.y - floor) * MODEL_SCALE, (p.center.z - cz) * MODEL_SCALE), pu = p.u, pv = p.v)
+                pos = V3((p.center.x - cx) * MODEL_SCALE, (p.center.y - floor) * MODEL_SCALE, (p.center.z - cz) * MODEL_SCALE), pu = p.u, pv = p.v,
+                evidence = Evidence(Evidence.Source.SCANNER, views = p.support, spreadM = p.spreadM, shapeShare = p.shapeShare))
         }
     }
 
     fun outline(shape: String, e: Float): List<Pair<Float, Float>> = Catalog.polygon(shape).map { (a, b) -> a * e to b * e }
 
-    fun draw(scene: Scene, placed: List<Placed>, selected: Int) {
-        for (pl in placed) TileMesh.build(scene, pl.piece.shape, pl.piece.size, pl.center, pl.u, pl.v, pl.edge, Color(pl.piece.color), pl.piece.id, pl.piece.id == selected)
+    /** [colorOf]: troca a cor (modo confiança). [ghostOf]: transparência por peça (Raio-X). */
+    fun draw(scene: Scene, placed: List<Placed>, selected: Int, colorOf: (Placed) -> Int = { it.piece.color }, ghostOf: (Placed) -> Float = { 1f }) {
+        for (pl in placed) TileMesh.build(scene, pl.piece.shape, pl.piece.size, pl.center, pl.u, pl.v, pl.edge, Color(colorOf(pl)), pl.piece.id, pl.piece.id == selected, ghost = ghostOf(pl))
     }
 
     /**
@@ -128,7 +134,7 @@ object Layout {
     fun solve(placed: List<Placed>, selected: Int): List<Placed> {
         val bodies = placed.map { Collision.Body(it.piece.id, it.piece.shape, it.center, it.u, it.v, it.edge, fixed = selected >= 0 && it.piece.id != selected, size = it.piece.size) }
         Collision.resolve(bodies, iters = 80)
-        return placed.mapIndexed { i, pl -> pl.copy(center = bodies[i].center) }
+        return placed.mapIndexed { i, pl -> pl.copy(center = bodies[i].center, pushed = (bodies[i].center - pl.center).len()) }
     }
 
     /**
@@ -194,7 +200,8 @@ object Detector {
         val px = IntArray(w * h); b.getPixels(px, 0, w, 0, 0, w, h)
         var id = startId
         return PhotoPieces.from(Segmenter.segment(px, w, h, maxBlobs = 60)).map { d ->
-            Piece(id++, d.cx / w, d.cy / h, d.w / w, d.h / h, d.shape, size = d.size, color = d.color, spin = d.spin, spinTop = d.spinTop)
+            Piece(id++, d.cx / w, d.cy / h, d.w / w, d.h / h, d.shape, size = d.size, color = d.color, spin = d.spin, spinTop = d.spinTop,
+                evidence = Evidence(Evidence.Source.FOTO, fitIoU = d.fit))
         }
     }
 }
