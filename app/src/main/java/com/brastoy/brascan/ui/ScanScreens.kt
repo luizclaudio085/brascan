@@ -129,7 +129,7 @@ class ScanState {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ScanScreen(st: ScanState, openAr: () -> Unit, open3D: () -> Unit) {
+fun ScanScreen(st: ScanState, openAr: () -> Unit, openArCore: () -> Unit, open3D: () -> Unit) {
     val ctx = LocalContext.current
     var photoUri by remember { mutableStateOf<Uri?>(null) }
     var pendingLoad by remember { mutableStateOf<Uri?>(null) }
@@ -154,10 +154,17 @@ fun ScanScreen(st: ScanState, openAr: () -> Unit, open3D: () -> Unit) {
     Column(Modifier.verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         GlassCard(Modifier.fillMaxWidth()) {
             Label("Scanner 3D (SLAM)")
-            Text("Ande em volta da construção com a câmera: o celular rastreia a própria posição, mede a profundidade e monta as peças em 3D com a orientação real.",
+            Text("Ande devagar em volta da construção: o app reconhece as peças pela câmera e usa as medidas delas (e a gravidade do celular) para saber onde o celular está e montar tudo em 3D. Funciona sem Google/ARCore.",
                 color = Color(0xFFC9D6EA), fontSize = 14.sp, modifier = Modifier.padding(top = 6.dp))
             Button(onClick = openAr, modifier = Modifier.fillMaxWidth().padding(top = 12.dp).height(56.dp), shape = RoundedCornerShape(18.dp)) {
                 Icon(Icons.Rounded.ViewInAr, null); Spacer(Modifier.width(10.dp)); Text("Escanear em 3D", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            }
+            // ARCore só aparece se já estiver instalado: nunca pede para instalar nada do Google
+            val arCoreInstalled = remember {
+                runCatching { com.google.ar.core.ArCoreApk.getInstance().checkAvailability(ctx) == com.google.ar.core.ArCoreApk.Availability.SUPPORTED_INSTALLED }.getOrDefault(false)
+            }
+            if (arCoreInstalled) androidx.compose.material3.TextButton(onClick = openArCore, modifier = Modifier.fillMaxWidth()) {
+                Text("Usar ARCore do Google (opcional, este celular tem)", color = Palette.muted, fontSize = 13.sp)
             }
         }
         GlassCard(Modifier.fillMaxWidth()) {

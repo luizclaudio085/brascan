@@ -188,9 +188,9 @@ class FusionMap(val cell: Float = .006f) {
 
 /** Encaixes: peças reais ficam em pé ou deitadas; pequenos desvios são ruído do sensor. */
 object Snap {
-    private val tol = Math.toRadians(14.0).toFloat()
+    private val tol0 = Math.toRadians(14.0).toFloat()
 
-    fun normal(n: V3, up: V3): V3 {
+    fun normal(n: V3, up: V3, tol: Float = tol0): V3 {
         val d = n.dot(up)
         return when {
             abs(d) > kotlin.math.cos(tol) -> if (d > 0) up else up * -1f
@@ -199,9 +199,25 @@ object Snap {
         }
     }
 
-    fun angle(a: Float): Float {
+    fun angle(a: Float, tol: Float = tol0): Float {
         val q = (Math.PI / 2).toFloat()
         val r = Math.round(a / q) * q
         return if (abs(a - r) < tol) r else a
+    }
+
+    /**
+     * Base (u, v, n) encaixada: normal vertical/horizontal se estiver a menos de [degN] graus; numa peça em pé,
+     * a borda também alinha com a gravidade se estiver a menos de [degA] graus.
+     */
+    fun basis(u: V3, v: V3, up: V3 = V3.UP, degN: Double = 20.0, degA: Double = 15.0): Triple<V3, V3, V3> {
+        val n = normal(u.cross(v).norm(), up, Math.toRadians(degN).toFloat())
+        var vv = (v - n * v.dot(n)).norm(); var uu = vv.cross(n).norm()
+        if (abs(n.dot(up)) < .5f) { // em pé: gira no plano para alinhar com a vertical
+            val vUp = (up - n * up.dot(n)).norm(); val uUp = vUp.cross(n).norm()
+            val a = kotlin.math.atan2(vv.dot(uUp) * -1f, vv.dot(vUp))
+            val sa = angle(a, Math.toRadians(degA).toFloat())
+            if (sa != a) { val c = kotlin.math.cos(sa); val s = kotlin.math.sin(sa); vv = (vUp * c - uUp * s).norm(); uu = vv.cross(n).norm() }
+        }
+        return Triple(uu, vv, n)
     }
 }

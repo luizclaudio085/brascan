@@ -20,7 +20,8 @@ fotos reais das peças enviadas pelo usuário. **Não há celular físico aqui**
 | Malha das peças | `three/TileMesh.kt` | ✅ (emulador) | Aro, painel translúcido, ímãs nas posições do `magnetSites` do simulador, nervuras. |
 | Renderizador | `three/GlRenderer.kt` | ✅ (emulador) | z-buffer, MSAA 4×, Blinn-Phong + Fresnel + hemisfério, sombra suave (7 amostras), cena preparada uma vez, translúcidos ordenados. FPS no celular real: **não medido**. |
 | Scanner por foto → 3D | `scan/Pieces.kt`, `ui/ScanScreens.kt` | ✅ (emulador) | Foto real → 13 peças no 3D, sem interpenetração. |
-| SLAM / ARCore | `ar/ArScanner.kt` | 🟡 | Pose 6DoF, profundidade, nuvem de pontos e planos vêm do ARCore. Emulador sem ARCore: só o caminho de erro foi validado. |
+| SLAM sem Google (padrão) | `vision/PlanarPose.kt`, `vision/PieceSlam.kt`, `ar/MarkerScanScreen.kt` | ✅ (sintético) / 🟡 (celular) | Peças como marcadores: cantos → homografia → refino; associação por consenso de hipóteses de câmera (relocaliza e fecha o laço); gravidade; escala por consistência entre vistas; forma votada no plano retificado. `PieceSlamTest` (volta completa, 480×360, só cor): posição 0,3–1,0 cm (quadrados/retângulo/moldura), 1,0–3,3 cm (quadrado de lado, com gravidade ruidosa), triângulo 0,5–1,5 cm e normal ~9°. Câmera do emulador estava travada: **tela ainda não vista funcionando com imagem**. |
+| SLAM / ARCore (opcional) | `ar/ArScanner.kt` | 🟡 | Pose 6DoF, profundidade, nuvem de pontos e planos vêm do ARCore. Emulador sem ARCore: só o caminho de erro foi validado. |
 | Fusão volumétrica | `vision/Fusion.kt` (voxels 6 mm) | ✅ (sintético) / 🟡 (real) | `SyntheticScanTest`: 6 peças, centro < 2 mm, normal < 1°, com ruído de 3 mm. Sem profundidade (só nuvem): acha as peças, forma imprecisa. |
 | Exportação JSON | `Layout.json` | ✅ | Formato `projectData` do simulador (`items`, unidade = lado grande). Reimportação no simulador: **não testada ainda**. |
 | Exportação B4/B5 | `scan/B5Export.kt`, `assets/b5codec.js` (extraído por `tools/extrair_codec_b5.py`) | ✅ | Codec **do próprio simulador** num WebView. Ida e volta: castelo real 1221 peças, exemplo 301 peças (`tools/testar_b5.cjs`, roda no CI). No celular: exporta → reimporta → compara. **Simulador real (MK-10.16) importou 13/13 peças** do código gerado no emulador a partir da foto real. Cores mapeadas para a paleta de 7 cores do formato. |
@@ -41,7 +42,7 @@ fotos reais das peças enviadas pelo usuário. **Não há celular físico aqui**
 | 8 | AR: sobreposição recriada a cada quadro | ✅ corrigido (cache por lista de peças) |
 | 9 | Peças em AR não passam pela colisão antes de exibir na câmera (só ao importar) | ⬜ |
 | 11 | Exportação recusada pelo simulador (0/13): altura arredondada abaixo do chão, espessura escalada no médio, encaixe no mesmo plano da moldura | ✅ corrigido: espessura absoluta 0,065, folga > 1/256, encaixe empilhado → 13/13 |
-| 12 | Celular do usuário não suporta ARCore (Play Store: "dispositivo não compatível") | 🟠 em andamento: scanner próprio sem Google |
+| 12 | Celular do usuário não suporta ARCore (Play Store: "dispositivo não compatível") | ✅ scanner próprio sem Google é o padrão; opção ARCore só aparece se já estiver instalado |
 | 10 | Tamanho do triângulo sai menor que o real (pontas perdem pixels) | 🟠 compensado ×1,1 (calibrado em 1 foto) |
 
 ## 3. Estado por fase do projeto mestre
