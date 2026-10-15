@@ -63,7 +63,8 @@ class OrbitGlView(ctx: Context) : GLSurfaceView(ctx), GLSurfaceView.Renderer {
 
     override fun onDrawFrame(g: GL10?) {
         val now = System.nanoTime()
-        if (last != 0L && autoRotate && System.currentTimeMillis() - lastTouch > 2500) camera.yaw += (now - last) / 9000f * .25f
+        // giro lento de vitrine (1,5°/s); [now] é em nanossegundos — antes dividia como se fosse ms e girava feito louco
+        if (last != 0L && autoRotate && System.currentTimeMillis() - lastTouch > 2500) camera.yaw += ((now - last) / 1e6f).coerceIn(0f, 100f) / 9000f * .25f
         last = now
         GLES20.glClearColor(.02f, .03f, .06f, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)

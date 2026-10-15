@@ -91,6 +91,9 @@ data class MarkerStatus(
     /** Ajustes globais aceitos (laços fechados) e o erro de reprojeção depois do último. */
     val loops: Int = 0,
     val reprojPx: Double = Double.NaN,
+    /** Gravação de diagnóstico em andamento e quantos quadros já foram guardados. */
+    val recording: Boolean = false,
+    val recorded: Int = 0,
 )
 
 /**
@@ -107,14 +110,22 @@ fun MarkerScanScreen(initialMap: String? = null, onClose: () -> Unit, onDone: (L
     val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { permission = it }
     LaunchedEffect(Unit) { if (!permission) ask.launch(Manifest.permission.CAMERA) }
     var status by remember { mutableStateOf(MarkerStatus()) }
-    val engine = remember { Engine(ctx, initialMap) { status = it } }
+    // como a pré-visualização foi desenhada (SurfaceView ou TextureView): decide como a RA fica por cima dela
+    var previewIsSurface by remember { mutableStateOf<Boolean?>(null) }
+    val engine = remember { Engine(ctx, initialMap, { status = it }) { previewIsSurface = it } }
     DisposableEffect(Unit) { engine.startSensors(); onDispose { engine.stop() } }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         if (permission) {
             AndroidView(factory = { c ->
-                PreviewView(c).apply { scaleType = PreviewView.ScaleType.FILL_CENTER; implementationMode = PreviewView.ImplementationMode.COMPATIBLE }.also { pv -> engine.bind(owner, pv) }
+                PreviewView(c).apply { scaleType = PreviewView.ScaleType.FILL_CENTER; implementationMode = PreviewView.ImplementationMode.PERFORMANCE }.also { pv -> engine.bind(owner, pv) }
             }, modifier = Modifier.fillMaxSize())
+            // peças 3D por cima das peças de verdade (RA sem ARCore): as já confirmadas sólidas, as novas fantasma.
+            // Só nasce depois de saber como a pré-visualização é desenhada: sobre SurfaceView a RA fica entre a
+            // câmera e os botões; sobre TextureView precisa ficar por cima da janela toda.
+            previewIsSurface?.let { surface ->
+                AndroidView(factory = { c -> ArOverlayView(c, onTopOfWindow = !surface).also { engine.overlay = it } }, modifier = Modifier.fillMaxSize())
+            }
             // contornos das peças reconhecidas neste quadro, desenhados por cima da imagem
             Canvas(Modifier.fillMaxSize()) {
                 val s = status; val k = max(size.width / s.imgW, size.height / s.imgH)
@@ -145,8 +156,12 @@ fun MarkerScanScreen(initialMap: String? = null, onClose: () -> Unit, onDone: (L
         }
         Row(Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(16.dp).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             FilledTonalButton(onClick = { engine.reset() }, modifier = Modifier.height(54.dp)) { Icon(Icons.Rounded.Refresh, null); Spacer(Modifier.width(6.dp)); Text(if (status.resuming) "Ignorar salvo" else "Recomeçar") }
+            // diagnóstico: grava quadros + decisões do SLAM num .zip para analisar no PC o que deu errado
+            FilledTonalButton(onClick = { if (status.recording) engine.stopRecording { Diagnostico.share(ctx, it) } else engine.startRecording() }, modifier = Modifier.height(54.dp)) {
+                Text(if (status.recording) "⏹ ${status.recorded}" else "⏺ Gravar", maxLines = 1)
+            }
             Button(enabled = status.pieces.isNotEmpty(), onClick = { engine.finish()?.let { (ps, map) -> onDone(ps, map) } ?: onDone(status.pieces, engine.exportMap()) }, modifier = Modifier.weight(1f).height(54.dp)) {
-                Icon(Icons.Rounded.ViewInAr, null); Spacer(Modifier.width(8.dp)); Text("Usar no 3D (${status.pieces.size})", fontWeight = FontWeight.Bold)
+                Icon(Icons.Rounded.ViewInAr, null); Spacer(Modifier.width(8.dp)); Text("3D (${status.pieces.size})", fontWeight = FontWeight.Bold, maxLines = 1)
             }
         }
     }
@@ -154,7 +169,7 @@ fun MarkerScanScreen(initialMap: String? = null, onClose: () -> Unit, onDone: (L
 
 /** Câmera + sensores + SLAM numa thread de análise só (quadros antigos são descartados). */
 @OptIn(ExperimentalCamera2Interop::class)
-private class Engine(private val ctx: Context, private var initialMap: String?, private val publish: (MarkerStatus) -> Unit) : SensorEventListener {
+private class Engine(private val ctx: Context, private var initialMap: String?, private val publish: (MarkerStatus) -> Unit, private val onPreviewKind: (Boolean) -> Unit) : SensorEventListener {
     private val exec = Executors.newSingleThreadExecutor()
     private val sm = ctx.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     @Volatile private var gravity: FloatArray? = null
@@ -163,6 +178,15 @@ private class Engine(private val ctx: Context, private var initialMap: String?, 
     private var sensorOrientation = 90
     private var provider: ProcessCameraProvider? = null
     private var lastT = 0L; private var fps = 0f
+    /** Sobreposição 3D (RA) alimentada a cada quadro analisado. */
+    @Volatile var overlay: ArOverlayView? = null
+    @Volatile private var diag: Diagnostico? = null
+    @Volatile private var lastRot = 0
+
+    fun startRecording() { exec.execute { diag = Diagnostico(ctx) } }
+    fun stopRecording(then: (java.io.File) -> Unit) {
+        exec.execute { diag?.let { d -> diag = null; val zip = d.finish(slam?.export()); ContextCompat.getMainExecutor(ctx).execute { then(zip) } } }
+    }
 
     fun startSensors() {
         (sm.getDefaultSensor(Sensor.TYPE_GRAVITY) ?: sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER))?.let { sm.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
@@ -189,10 +213,16 @@ private class Engine(private val ctx: Context, private var initialMap: String?, 
             val analysis = ImageAnalysis.Builder().setTargetResolution(Size(640, 480))
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
             analysis.setAnalyzer(exec) { img ->
-                try { process(img) } catch (_: Exception) { } finally { img.close() }
+                // uma exceção no quadro não pode derrubar a câmera, mas também não pode sumir em silêncio
+                try { process(img) } catch (e: Exception) { android.util.Log.w("BraScan", "quadro do scanner falhou", e) } finally { img.close() }
             }
             p.unbindAll()
             val cam = p.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
+            // PreviewView só cria o filho (SurfaceView ou TextureView) ao receber a superfície: espera ele aparecer
+            fun kind(): Boolean? = (0 until pv.childCount).map { pv.getChildAt(it) }.firstNotNullOfOrNull { v -> if (v is android.view.SurfaceView) true else if (v is android.view.TextureView) false else null }
+            var tries = 0
+            fun poll() { kind()?.let { onPreviewKind(it) } ?: if (tries++ < 40) pv.postDelayed({ poll() }, 100) else onPreviewKind(false) }
+            poll()
             val info = Camera2CameraInfo.from(cam.cameraInfo)
             sensorOrientation = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
             calib = Calib(
@@ -240,10 +270,14 @@ private class Engine(private val ctx: Context, private var initialMap: String?, 
         val (rgb, w, h) = ArScanView.yuvToArgb(image, outW)
         val k = intr ?: intrinsics(w, h).also { intr = it }
         val s = slam ?: PieceSlam(k).also { sl -> initialMap?.let { sl.restore(it) }; slam = sl }
+        val t0 = SystemClock.elapsedRealtime()
         val seg = Segmenter.segment(rgb, w, h, minFrac = .0015f)
         val up = upInCamera()
         val dets = s.track(seg, up)
         val now = SystemClock.elapsedRealtime()
+        val rot0 = img.imageInfo.rotationDegrees; lastRot = rot0
+        overlay?.frame = OverlayFrame(s.camera, s.lost, k, w, h, rot0, s.map.map { it.toPiece3D() to it.count })
+        diag?.let { d -> runCatching { d.frame(rgb, w, h, rot0, k, up, s, dets, now - t0) } }
         if (lastT != 0L) fps = fps * .8f + 200f / (now - lastT).coerceAtLeast(1)
         lastT = now
         // contornos para desenhar: gira do sensor para a tela em pé
@@ -264,6 +298,7 @@ private class Engine(private val ctx: Context, private var initialMap: String?, 
         }
         publish(MarkerStatus(hint, !s.lost, s.map.size, pieces, dets.map { d -> d.imgCorners.map { upright(it[0], it[1]) } to d.color }, uw, uh, fps, up != null,
             target, adv.map { it.text }, s.restoredMap && !s.relocalized,
-            s.baReports.count { it.accepted }, s.baReports.lastOrNull { it.accepted }?.rmsAfter ?: Double.NaN))
+            s.baReports.count { it.accepted }, s.baReports.lastOrNull { it.accepted }?.rmsAfter ?: Double.NaN,
+            diag != null, diag?.frames ?: 0))
     }
 }

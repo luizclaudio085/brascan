@@ -367,7 +367,7 @@ fun ModelScreen(st: ScanState) {
     Column(Modifier.fillMaxSize()) {
         Box(Modifier.fillMaxWidth().weight(1f)) {
             GlViewport(Modifier.fillMaxSize(), camera, key = listOf(if (demo) "demo" else st.sceneKey(), mode, ghost, explode, highlight, pickA, hyps.map { it.key }, focusHyp, step),
-                autoRotate = st.selected < 0 && pickA < 0 && stepId < 0, clipY = clipY, clipX = clipX,
+                autoRotate = demo && st.selected < 0 && pickA < 0 && stepId < 0, // só o exemplo gira; o seu modelo fica parado clipY = clipY, clipX = clipX,
                 onTap = { id ->
                     if (demo || mode == Mode.MONTAR) return@GlViewport
                     when (mode) {
