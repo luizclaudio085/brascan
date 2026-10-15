@@ -106,7 +106,7 @@ fun MarkerScanScreen(onClose: () -> Unit, onDone: (List<Piece3D>) -> Unit) {
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         if (permission) {
             AndroidView(factory = { c ->
-                PreviewView(c).apply { scaleType = PreviewView.ScaleType.FILL_CENTER }.also { pv -> engine.bind(owner, pv) }
+                PreviewView(c).apply { scaleType = PreviewView.ScaleType.FILL_CENTER; implementationMode = PreviewView.ImplementationMode.COMPATIBLE }.also { pv -> engine.bind(owner, pv) }
             }, modifier = Modifier.fillMaxSize())
             // contornos das peças reconhecidas neste quadro, desenhados por cima da imagem
             Canvas(Modifier.fillMaxSize()) {
