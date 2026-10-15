@@ -1,5 +1,6 @@
 package com.brastoy.brascan.vision
 
+import com.brastoy.brascan.three.V3
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -21,10 +22,15 @@ object Assembly {
         return min(va.maxOf { it.x }, vb.maxOf { it.x }) - max(va.minOf { it.x }, vb.minOf { it.x }) > -.02f &&
             min(va.maxOf { it.z }, vb.maxOf { it.z }) - max(va.minOf { it.z }, vb.minOf { it.z }) > -.02f
     }
-    /** Encostadas (ímã com ímã): cantos a menos de ~8% do lado. */
+    private fun segDist(p: V3, a: V3, b: V3): Float {
+        val ab = b - a; val l2 = ab.dot(ab)
+        val t = if (l2 > 0f) ((p - a).dot(ab) / l2).coerceIn(0f, 1f) else 0f
+        return (p - (a + ab * t)).len()
+    }
+    /** Encostadas (ímã com ímã): algum canto a menos de ~8% do lado de uma borda da outra. */
     private fun touching(a: Measure.P, b: Measure.P): Boolean {
         val va = a.vertices(); val vb = b.vertices(); val lim = .08f * max(a.edge, b.edge)
-        for (p in va) for (q in vb) if ((p - q).len() < lim) return true
+        for ((x, y) in listOf(va to vb, vb to va)) for (p in x) for (k in y.indices) if (segDist(p, y[k], y[(k + 1) % y.size]) < lim) return true
         return false
     }
 
@@ -33,15 +39,16 @@ object Assembly {
     fun name(p: Measure.P, color: Int) = "${(Catalog.LABEL[p.shape] ?: p.shape).lowercase()} ${colorName(color)} ${sizeName(p.size)}"
 
     private fun posture(p: Measure.P): String = when {
-        abs(p.n.y) > .8f -> "deitado no chão"
+        abs(p.n.y) > .8f -> if (bottom(p) < .1f) "deitado no chão" else "deitado"
         abs(p.n.y) < .3f -> if (abs(p.n.z) >= abs(p.n.x)) "em pé, virado para a frente" else "em pé, virado para o lado"
         else -> "inclinado"
     }
 
     /** [colors]: cor de cada peça (id → ARGB). */
     fun plan(ps: List<Measure.P>, colors: Map<Int, Int>): Plan {
+        // apoio = peça mais baixa logo embaixo (vizinha na mesma altura não segura)
         val supporters = ps.associate { p ->
-            p.id to if (bottom(p) < .1f) emptyList() else ps.filter { q -> q !== p && top(q) in (bottom(p) - .12f)..(bottom(p) + .05f) && footprintOverlap(p, q) }
+            p.id to if (bottom(p) < .1f) emptyList() else ps.filter { q -> q !== p && q.center.y < p.center.y - .03f && top(q) in (bottom(p) - .12f)..(bottom(p) + .05f) && footprintOverlap(p, q) }
         }
         val placed = LinkedHashSet<Int>(); val steps = ArrayList<Step>()
         var last: Measure.P? = null
@@ -73,7 +80,7 @@ object Assembly {
     private fun relation(p: Measure.P, ref: Measure.P, refColor: Int, onGround: Boolean): String {
         val d = p.center - ref.center; val e = max(p.edge, ref.edge)
         val rn = "do ${(Catalog.LABEL[ref.shape] ?: ref.shape).lowercase()} ${colorName(refColor)}"
-        val glued = if (touching(p, ref)) "encostado " else "perto "
+        val glued = if (touching(p, ref)) "encostado " else "perto, "
         return when {
             !onGround && d.y > .4f * e && abs(d.y) >= max(abs(d.x), abs(d.z)) * .8f -> "em cima $rn"
             abs(d.x) >= abs(d.z) -> glued + (if (d.x > 0) "à direita $rn" else "à esquerda $rn")

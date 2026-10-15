@@ -51,6 +51,25 @@ class AssemblyTest {
         assertEquals(9, plan.bom.sumOf { it.count })
     }
 
+    /** Laje deitada em cima de paredes: "deitado" (não "no chão"), "em cima", e encosta pela borda (meio da aresta). */
+    @Test fun slabOnWallsIsOnTopNotOnFloor() {
+        val ps = listOf(piece("quadrado", V3(0f, .5f, .5f), X, Y, red), piece("quadrado", V3(0f, .5f, -.5f), X, Y, red),
+            piece("retangulo", V3(0f, 1.0325f, 0f), X, V3(0f, 0f, -1f), blue))
+        val plan = Assembly.plan(ps, colors)
+        val slab = plan.steps.last(); println(slab.text)
+        assertEquals(ps[2].id, slab.pieceId)
+        assertTrue(slab.text.contains("deitado,") && !slab.text.contains("no chão") && slab.text.contains("em cima"))
+    }
+
+    /** Duas lajes lado a lado na mesma altura não se seguram uma à outra (senão travava a ordem e dava aviso falso). */
+    @Test fun sideBySideSlabsDoNotHoldEachOther() {
+        val ps = listOf(piece("quadrado", V3(-.5f, .5f, 0f), Z, Y, red), piece("quadrado", V3(.5f, .5f, 0f), Z, Y, red), piece("quadrado", V3(1.5f, .5f, 0f), Z, Y, red),
+            piece("quadrado", V3(0f, 1.0325f, 0f), X, V3(0f, 0f, -1f), blue), piece("quadrado", V3(1f, 1.0325f, 0f), X, V3(0f, 0f, -1f), blue))
+        val plan = Assembly.plan(ps, colors)
+        assertTrue(plan.steps.all { it.note.isEmpty() })
+        assertTrue(plan.steps.filter { it.pieceId == ps[3].id || it.pieceId == ps[4].id }.all { it.text.contains("em cima") })
+    }
+
     @Test fun floatingPieceGoesLastWithWarning() {
         val ps = listOf(piece("quadrado", V3(0f, .5f, 0f), X, Y, red), piece("quadrado", V3(3f, 1.5f, 0f), X, Y, blue))
         val plan = Assembly.plan(ps, colors)
