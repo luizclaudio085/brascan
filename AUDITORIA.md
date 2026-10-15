@@ -64,6 +64,7 @@ fotos reais das peças enviadas pelo usuário. **Não há celular físico aqui**
 | 13 B5 validado | ✅ exportação conservadora; modo experimental depende das hipóteses (fase 9) |
 | 14 Atualizações GitHub | ✅ |
 | 15 Otimização e testes físicos | ⛔ depende de celular físico |
+| Extra: manual de montagem | ✅ (testes + emulador) modo "Montar" na aba 3D: lista de peças por forma/cor/tamanho, depois um passo por peça em ordem montável (piso primeiro, de baixo para cima, peça só depois do que a segura, sempre encostada no que já está montado), peça nova em destaque e as seguintes escondidas, texto com postura e posição relativa ("em cima do quadrado verde", "encostado à esquerda do…"); peça sem apoio visível vai por último com aviso. `AssemblyTest` 3/3. Não testado com construção real escaneada |
 
 ## 4. Divergências com o simulador (decididas em 15/10/2026)
 

@@ -95,6 +95,7 @@ import com.brastoy.brascan.scan.SIZES
 import com.brastoy.brascan.scan.Vista
 import com.brastoy.brascan.vision.Assessment
 import com.brastoy.brascan.vision.Catalog
+import com.brastoy.brascan.vision.Assembly
 import com.brastoy.brascan.vision.Confidence
 import com.brastoy.brascan.vision.Evidence
 import com.brastoy.brascan.vision.Inference
@@ -311,7 +312,7 @@ private fun PhotoMarker(st: ScanState) {
 }
 
 /** Modelo 3D editável: toque numa peça para selecionar e ajustar. */
-private enum class Mode(val label: String) { MODELO("Modelo"), CONFIANCA("Confiança"), MEDIR("Medir"), RAIOX("Raio-X") }
+private enum class Mode(val label: String) { MODELO("Modelo"), CONFIANCA("Confiança"), MEDIR("Medir"), RAIOX("Raio-X"), MONTAR("Montar") }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -326,6 +327,7 @@ fun ModelScreen(st: ScanState) {
     var cutX by remember { androidx.compose.runtime.mutableFloatStateOf(1f) }
     var ghost by remember { mutableStateOf(false) }
     var explode by remember { androidx.compose.runtime.mutableFloatStateOf(0f) }
+    var step by remember { mutableIntStateOf(0) } // manual: 0 = lista de peças, 1..N = passos
 
     // Enquadra a câmera no tamanho do modelo sempre que ele muda.
     androidx.compose.runtime.LaunchedEffect(st.pieces.size, st.vista) {
@@ -342,22 +344,32 @@ fun ModelScreen(st: ScanState) {
     val assess = placed.associate { it.piece.id to Confidence.assess(evidenceOf(it), (it.pushed * Catalog.SIDE_M).toDouble(), (it.edge * Catalog.SIDE_M).toDouble()) }
     val mpieces = placed.map { Measure.P(it.piece.id, it.piece.shape, it.piece.size, it.center, it.u, it.v, it.edge, evidenceOf(it)) }
 
+    // Manual de montagem: ordem calculada do modelo; mostra só o que já foi montado até o passo atual
+    val plan = remember(mpieces.map { listOf(it.id, it.center, it.u, it.v) }, placed.map { it.piece.color }) { Assembly.plan(mpieces, placed.associate { it.piece.id to it.piece.color }) }
+    if (step > plan.steps.size) step = plan.steps.size
+    val stepId = if (mode == Mode.MONTAR && step > 0) plan.steps[step - 1].pieceId else -1
+    val built = if (mode == Mode.MONTAR && step > 0) plan.steps.take(step).map { it.pieceId }.toSet() else null
+    androidx.compose.runtime.LaunchedEffect(stepId) {
+        placed.firstOrNull { it.piece.id == stepId }?.let { camera.target = camera.target + (it.center - camera.target) * .6f }
+    }
+
     // Raio-X: explosão (só visual) e cortes
     val c0 = if (placed.isEmpty()) V3.ZERO else placed.fold(V3.ZERO) { acc, p -> acc + p.center } * (1f / placed.size)
-    val shown = if (mode == Mode.RAIOX && explode > 0f) placed.map { it.copy(center = c0 + (it.center - c0) * (1f + explode)) } else placed
+    val shown = if (mode == Mode.RAIOX && explode > 0f) placed.map { it.copy(center = c0 + (it.center - c0) * (1f + explode)) }
+        else if (built != null) placed.filter { it.piece.id in built } else placed
     val yMax = (shown.maxOfOrNull { it.center.y + it.edge } ?: 1f); val xMin = shown.minOfOrNull { it.center.x - it.edge } ?: -1f; val xMax = shown.maxOfOrNull { it.center.x + it.edge } ?: 1f
     val clipY = if (mode == Mode.RAIOX && cutY < .999f) yMax * cutY else 9000f
     val clipX = if (mode == Mode.RAIOX && cutX < .999f) xMin + (xMax - xMin) * cutX else 9000f
-    val highlight = when (mode) { Mode.MEDIR -> if (pickB >= 0) pickB else pickA; else -> st.selected }
+    val highlight = when (mode) { Mode.MEDIR -> if (pickB >= 0) pickB else pickA; Mode.MONTAR -> stepId; else -> st.selected }
     val hyps = if (demo || mode !in setOf(Mode.CONFIANCA, Mode.RAIOX)) emptyList() else st.hypotheses()
     var focusHyp by remember { mutableStateOf<String?>(null) }
 
     Column(Modifier.fillMaxSize()) {
         Box(Modifier.fillMaxWidth().weight(1f)) {
-            GlViewport(Modifier.fillMaxSize(), camera, key = listOf(if (demo) "demo" else st.sceneKey(), mode, ghost, explode, highlight, pickA, hyps.map { it.key }, focusHyp),
-                autoRotate = st.selected < 0 && pickA < 0, clipY = clipY, clipX = clipX,
+            GlViewport(Modifier.fillMaxSize(), camera, key = listOf(if (demo) "demo" else st.sceneKey(), mode, ghost, explode, highlight, pickA, hyps.map { it.key }, focusHyp, step),
+                autoRotate = st.selected < 0 && pickA < 0 && stepId < 0, clipY = clipY, clipX = clipX,
                 onTap = { id ->
-                    if (demo) return@GlViewport
+                    if (demo || mode == Mode.MONTAR) return@GlViewport
                     when (mode) {
                         Mode.MEDIR -> if (id < 0) { pickA = -1; pickB = -1 } else if (pickA < 0 || pickB >= 0) { pickA = id; pickB = -1 } else if (id != pickA) pickB = id
                         else -> st.selected = id
@@ -377,6 +389,7 @@ fun ModelScreen(st: ScanState) {
                     demo -> "Escaneie uma foto na aba Scanner para ver o seu em 3D"
                     mode == Mode.MEDIR -> "Toque em duas peças para medir entre elas"
                     mode == Mode.CONFIANCA -> "Toque numa peça para ver o porquê da cor"
+                    mode == Mode.MONTAR -> if (step == 0) "Manual de montagem · ${plan.steps.size} passos" else "Passo $step de ${plan.steps.size} · peça nova em destaque"
                     mode == Mode.RAIOX -> "Visualização: não enxerga através de paredes reais" + if (hyps.isNotEmpty()) " · ${hyps.size} hipóteses em cinza" else ""
                     else -> "${st.pieces.size} peças · toque numa peça para editar"
                 }, color = Palette.muted, fontSize = 12.sp)
@@ -386,13 +399,14 @@ fun ModelScreen(st: ScanState) {
         GlassCard(Modifier.fillMaxWidth().padding(12.dp)) {
             SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
                 Mode.entries.forEachIndexed { i, m ->
-                    SegmentedButton(selected = mode == m, onClick = { mode = m; pickA = -1; pickB = -1 }, shape = SegmentedButtonDefaults.itemShape(i, Mode.entries.size)) { Text(m.label, fontSize = 12.sp, maxLines = 1) }
+                    SegmentedButton(selected = mode == m, onClick = { mode = m; pickA = -1; pickB = -1 }, shape = SegmentedButtonDefaults.itemShape(i, Mode.entries.size)) { Text(m.label, fontSize = 10.sp, maxLines = 1, softWrap = false, letterSpacing = 0.sp) }
                 }
             }
             when (mode) {
                 Mode.MODELO -> if (sel == null) ExportPanel(st, demo) else PieceEditor(st, sel)
                 Mode.CONFIANCA -> ConfidencePanel(st, sel, assess, demo)
                 Mode.MEDIR -> MeasurePanel(mpieces, pickA, pickB)
+                Mode.MONTAR -> AssemblyPanel(plan, step) { step = it.coerceIn(0, plan.steps.size) }
                 Mode.RAIOX -> Column(Modifier.heightIn(max = 340.dp).verticalScroll(rememberScrollState())) {
                     SliderRow("Corte de altura", cutY) { cutY = it }
                     SliderRow("Corte lateral", cutX) { cutX = it }
@@ -405,6 +419,32 @@ fun ModelScreen(st: ScanState) {
                     HypothesesPanel(st, hyps, focusHyp) { focusHyp = it }
                 }
             }
+        }
+    }
+}
+
+/** Manual de montagem: passo 0 é a lista de peças; depois um passo por peça, com anterior/próximo. */
+@Composable
+private fun AssemblyPanel(plan: Assembly.Plan, step: Int, onStep: (Int) -> Unit) {
+    val n = plan.steps.size
+    Column(Modifier.heightIn(max = 300.dp).verticalScroll(rememberScrollState())) {
+        if (n == 0) { Text("Nada para montar ainda: escaneie uma construção.", color = Palette.muted, fontSize = 13.sp); return@Column }
+        if (step == 0) {
+            Text("Separe as peças (${plan.bom.sumOf { it.count }}):", color = Color.White, fontWeight = FontWeight.SemiBold)
+            for (b in plan.bom) Row(Modifier.fillMaxWidth().padding(top = 4.dp)) {
+                Text("${b.count}×", color = Color(0xFF7FD6FF), fontWeight = FontWeight.Bold, modifier = Modifier.width(40.dp))
+                Text(b.label, color = Color.White, fontSize = 14.sp)
+            }
+            Text("A ordem vai de baixo para cima: cada peça só entra depois do que a segura.", color = Palette.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp))
+        } else {
+            val s = plan.steps[step - 1]
+            Text("Passo $step de $n", color = Color(0xFF7FD6FF), fontWeight = FontWeight.Bold)
+            Text(s.text, color = Color.White, fontSize = 15.sp, modifier = Modifier.padding(top = 4.dp))
+            if (s.note.isNotEmpty()) Text(s.note, color = Color(0xFFFFC531), fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
+        }
+        Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = { onStep(step - 1) }, enabled = step > 0, modifier = Modifier.weight(1f)) { Text(if (step == 1) "Lista" else "Anterior") }
+            Button(onClick = { onStep(if (step >= n) 0 else step + 1) }, modifier = Modifier.weight(1f)) { Text(when { step == 0 -> "Começar"; step >= n -> "Recomeçar"; else -> "Próximo" }) }
         }
     }
 }
