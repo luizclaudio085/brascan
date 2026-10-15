@@ -38,6 +38,9 @@ class Scene(
     val under: MutableList<Line3> = mutableListOf(),
     val shadows: MutableList<List<V3>> = mutableListOf(),
 ) {
+    /** Raio do desfoque da sombra (unidades da cena) e escurecimento. */
+    var shadowSoftness = .04f
+    var shadowAlpha = .38f
     fun box(c: V3, size: V3, color: Color, tag: Int = -1, alpha: Float = 1f, outline: Color? = null) {
         val (hx, hy, hz) = Triple(size.x / 2, size.y / 2, size.z / 2)
         fun p(sx: Int, sy: Int, sz: Int) = V3(c.x + sx * hx, c.y + sy * hy, c.z + sz * hz)

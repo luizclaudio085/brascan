@@ -13,6 +13,7 @@ import com.brastoy.brascan.three.GlSceneRenderer
 import com.brastoy.brascan.three.Line3
 import com.brastoy.brascan.three.MsaaChooser
 import com.brastoy.brascan.three.Scene
+import com.brastoy.brascan.three.TileMesh
 import com.brastoy.brascan.three.V3
 import com.brastoy.brascan.vision.Catalog
 import com.brastoy.brascan.vision.FrameProcessor
@@ -59,6 +60,7 @@ class ArScanView(ctx: Context, private val session: Session, private val onStatu
     private val view = FloatArray(16); private val proj = FloatArray(16)
     private var lastSample = 0L; private var lastExtract = 0L
     @Volatile private var pieces: List<Piece3D> = emptyList()
+    private var overlay = Scene(); private var overlayFor: List<Piece3D>? = null
     @Volatile private var cloud: List<Pair<V3, Int>> = emptyList()
     private val sectors = BooleanArray(12)
     @Volatile private var depthOn = false
@@ -151,12 +153,12 @@ class ArScanView(ctx: Context, private val session: Session, private val onStatu
             }
         }
 
-        val scene = Scene()
-        for (p in pieces) {
-            val o = Layout.outline(p.shape, Catalog.EDGE_M.getValue(p.size))
-            scene.prism(o, p.center, p.u, p.v, Catalog.THICKNESS_M, Color(p.color), -1, .55f, Color.White)
-            scene.lines += Line3(p.center, p.center + p.n * .025f, Color(0xFF7FD6FF), 3f)
+        val ps = pieces
+        if (ps !== overlayFor) {
+            overlay = Scene().also { sc -> for (p in ps) { TileMesh.build(sc, p.shape, p.size, p.center, p.u, p.v, Catalog.edgeM(p.size), Color(p.color), -1, false, shadow = false); sc.lines += Line3(p.center, p.center + p.n * .025f, Color(0xFF7FD6FF), 3f) } }
+            overlayFor = ps
         }
+        val scene = overlay
         val pose = cam.pose
         gl.draw(scene, view, proj, V3(pose.tx(), pose.ty(), pose.tz()), cloud, pointSize = 5f)
     }

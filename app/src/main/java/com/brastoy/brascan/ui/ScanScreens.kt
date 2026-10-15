@@ -109,7 +109,15 @@ class ScanState {
     private var nextId = 1
     fun newId() = nextId++
     fun aspect() = image?.let { it.width.toFloat() / it.height } ?: 1f
-    fun placed(): List<Placed> = Layout.place(pieces, vista, aspect())
+    private var cacheKey: Any? = null
+    private var cache: List<Placed> = emptyList()
+    /** Posições finais (com colisão resolvida), recalculadas só quando peças/vista/seleção mudam. */
+    fun placed(): List<Placed> {
+        val key = Triple(pieces.toList(), vista, selected)
+        if (key != cacheKey) { cache = Layout.solve(Layout.place(pieces, vista, aspect()), selected); cacheKey = key }
+        return cache
+    }
+    fun sceneKey(): Any = Triple(pieces.toList(), vista, selected)
     /** Substitui as peças pelas reconstruídas no scanner 3D (pose real, sem foto). */
     fun importScan(found: List<com.brastoy.brascan.vision.Piece3D>) {
         image = null; selected = -1; pieces.clear()
@@ -238,9 +246,10 @@ fun ModelScreen(st: ScanState) {
     val ctx = LocalContext.current
     val camera = remember { Camera(yaw = .35f, pitch = .3f, distance = 5f, target = V3(0f, .5f, 0f)) }
     val demo = st.pieces.isEmpty()
+    val demoPlaced = remember { Layout.solve(demoModel(), -1) }
     // Enquadra a câmera no tamanho do modelo sempre que ele muda.
     androidx.compose.runtime.LaunchedEffect(st.pieces.size, st.vista) {
-        val pts = (if (demo) demoModel() else st.placed()).map { it.center }
+        val pts = (if (demo) demoPlaced else st.placed()).map { it.center }
         if (pts.isEmpty()) return@LaunchedEffect
         val c = V3(pts.sumOf { it.x.toDouble() }.toFloat() / pts.size, pts.sumOf { it.y.toDouble() }.toFloat() / pts.size, pts.sumOf { it.z.toDouble() }.toFloat() / pts.size)
         val r = pts.maxOf { (it - c).len() } + .8f
@@ -248,9 +257,9 @@ fun ModelScreen(st: ScanState) {
     }
     Column(Modifier.fillMaxSize()) {
         Box(Modifier.fillMaxWidth().weight(1f)) {
-            GlViewport(Modifier.fillMaxSize(), camera, autoRotate = st.selected < 0, onTap = { if (!demo) st.selected = it }) { s ->
-                s.floorGrid(6, .8f)
-                val placed = if (demo) demoModel() else st.placed()
+            GlViewport(Modifier.fillMaxSize(), camera, key = if (demo) "demo" else st.sceneKey(), autoRotate = st.selected < 0, onTap = { if (!demo) st.selected = it }) { s ->
+                s.floorGrid(8, .5f)
+                val placed = if (demo) demoPlaced else st.placed()
                 Layout.draw(s, placed, st.selected)
             }
             Column(Modifier.padding(14.dp).align(Alignment.TopStart)) {
@@ -314,21 +323,21 @@ private fun Stepper(label: String, minus: () -> Unit, plus: () -> Unit) = Row(ve
 
 /** Casinha de exemplo para a aba 3D não ficar vazia antes do primeiro scan. */
 private fun demoModel(): List<Placed> {
-    val e = .8f; val h = e / 2; val t = e * .866f
+    val e = 1f; val h = e / 2; val t = e * .866f
     val c = Palette.tiles
     var id = 10_000
     fun p(shape: String, color: Int, at: V3, o: Orient, turn: Int = 0) =
-        Layout.fixed(Piece(id++, shape = shape, color = color, orient = o, turn = turn), at, o)
+        Layout.fixed(Piece(id++, shape = shape, size = "grande", color = color, orient = o, turn = turn), at, o)
     return listOf(
-        p("quadrado", c[0], V3(-h, h, e), Orient.FRENTE), p("janela", c[1], V3(h, h, e), Orient.FRENTE),
+        p("quadrado", c[0], V3(-h, h, e), Orient.FRENTE), p("porta", c[1], V3(h, h, e), Orient.FRENTE),
         p("quadrado", c[1], V3(-h, h, -e), Orient.FRENTE), p("quadrado", c[0], V3(h, h, -e), Orient.FRENTE),
         p("quadrado", c[2], V3(-e, h, h), Orient.LADO), p("quadrado", c[3], V3(-e, h, -h), Orient.LADO),
         p("janela", c[2], V3(e, h, h), Orient.LADO), p("quadrado", c[3], V3(e, h, -h), Orient.LADO),
         p("equilatero", c[4], V3(-h, e + t / 3, e), Orient.FRENTE), p("equilatero", c[5], V3(h, e + t / 3, e), Orient.FRENTE),
         p("equilatero", c[5], V3(-h, e + t / 3, -e), Orient.FRENTE), p("equilatero", c[4], V3(h, e + t / 3, -e), Orient.FRENTE),
-        p("quadrado", c[1], V3(-h, .03f, h), Orient.DEITADA), p("quadrado", c[0], V3(h, .03f, h), Orient.DEITADA),
-        p("quadrado", c[0], V3(-h, .03f, -h), Orient.DEITADA), p("quadrado", c[1], V3(h, .03f, -h), Orient.DEITADA),
-        p("retangulo", c[3], V3(e * 2.6f, h, 0f), Orient.LADO), p("retanguloTri", c[2], V3(-e * 2.2f, h, e * 1.2f), Orient.FRENTE),
+        p("quadrado", c[1], V3(-h, .0325f, h), Orient.DEITADA), p("moldura", c[0], V3(h, .0325f, h), Orient.DEITADA),
+        p("quadrado", c[0], V3(-h, .0325f, -h), Orient.DEITADA), p("quadrado", c[1], V3(h, .0325f, -h), Orient.DEITADA),
+        p("retangulo", c[3], V3(e * 2.2f, .25f, 0f), Orient.LADO), p("isoceles", c[2], V3(-e * 2f, h, e * 1.2f), Orient.FRENTE), p("L", c[4], V3(e * 2f, .0325f, e * 1.6f), Orient.DEITADA),
     )
 }
 

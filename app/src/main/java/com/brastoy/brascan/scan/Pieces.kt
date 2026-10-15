@@ -5,9 +5,11 @@ import android.graphics.Color as AColor
 import androidx.compose.ui.graphics.Color
 import com.brastoy.brascan.three.Scene
 import com.brastoy.brascan.three.V3
-import com.brastoy.brascan.three.shadowOf
+import com.brastoy.brascan.three.TileMesh
+import com.brastoy.brascan.vision.Collision
 import com.brastoy.brascan.vision.Catalog
 import com.brastoy.brascan.vision.Piece3D
+import com.brastoy.brascan.vision.PhotoPieces
 import com.brastoy.brascan.vision.Segmenter
 import org.json.JSONArray
 import org.json.JSONObject
@@ -24,9 +26,9 @@ val SHAPES = Catalog.SHAPES
 val SHAPE_LABEL = Catalog.LABEL
 val SIZES = Catalog.SIZES
 
-/** Unidades do modelo por metro: a peça média (7,5 cm) vira 0,8 unidade na tela. */
-const val MODEL_SCALE = .8f / .075f
-private fun edgeOf(size: String) = Catalog.EDGE_M.getValue(size) * MODEL_SCALE
+/** Unidades do modelo por metro: 1 unidade = lado do quadrado grande (mesma unidade do simulador MK). */
+const val MODEL_SCALE = 1f / Catalog.SIDE_M
+private fun edgeOf(size: String) = Catalog.SCALE.getValue(size)
 
 enum class Orient(val label: String) { FRENTE("Em pé ↔"), LADO("Em pé ↕"), DEITADA("Deitada") }
 
@@ -48,6 +50,7 @@ data class Piece(
     val lift: Float = 0f,
     val turn: Int = 0,
     val spin: Float = 0f,
+    val spinTop: Float = 0f,
     val pos: V3? = null, val pu: V3? = null, val pv: V3? = null,
 )
 
@@ -84,12 +87,12 @@ object Layout {
             } else {
                 val orient = p.orient ?: if (view == Vista.FRENTE) Orient.FRENTE else Orient.DEITADA
                 val (b0, b1) = baseFor(orient)
-                val (u, v) = rotate(b0, b1, p.spin + turn)
+                val (u, v) = rotate(b0, b1, (if (view == Vista.CIMA) p.spinTop else p.spin) + turn)
                 val c = if (p.pos != null) p.pos + V3.UP * (p.lift * edge) else {
                     val x = (p.cx - cx) * imgAspect * k
                     when (view) {
                         Vista.FRENTE -> V3(x, (floor - p.cy) * k + p.lift * edge, p.depth * edge)
-                        Vista.CIMA -> V3(x, (if (orient == Orient.DEITADA) .03f else edge / 2) + p.lift * edge, (p.cy - cy) * k + p.depth * edge)
+                        Vista.CIMA -> V3(x, (if (orient == Orient.DEITADA) Catalog.THICKNESS / 2 * edge else edge / 2) + p.lift * edge, (p.cy - cy) * k + p.depth * edge)
                     }
                 }
                 Placed(p, c, u, v, edge)
@@ -105,48 +108,27 @@ object Layout {
         if (found.isEmpty()) return emptyList()
         val cx = found.sumOf { it.center.x.toDouble() }.toFloat() / found.size
         val cz = found.sumOf { it.center.z.toDouble() }.toFloat() / found.size
-        val floor = found.minOf { p -> outline(p.shape, Catalog.EDGE_M.getValue(p.size)).minOf { (a, b) -> (p.center + p.u * a + p.v * b).y } }
+        val floor = found.minOf { p -> outline(p.shape, Catalog.edgeM(p.size)).minOf { (a, b) -> (p.center + p.u * a + p.v * b).y } }
         return found.mapIndexed { i, p ->
             Piece(firstId + i, shape = p.shape, size = p.size, color = p.color,
                 pos = V3((p.center.x - cx) * MODEL_SCALE, (p.center.y - floor) * MODEL_SCALE, (p.center.z - cz) * MODEL_SCALE), pu = p.u, pv = p.v)
         }
     }
 
-    fun outline(shape: String, e: Float): List<Pair<Float, Float>> {
-        val h = e / 2
-        return when (shape) {
-            "retangulo" -> listOf(-e to -h, e to -h, e to h, -e to h)
-            "equilatero" -> { val t = e * .866f; listOf(-h to -t / 3, h to -t / 3, 0f to t * 2 / 3) }
-            "retanguloTri" -> listOf(-h to -h, h to -h, -h to h)
-            "L" -> listOf(-h to -h, h to -h, h to -h / 3, -h / 3 to -h / 3, -h / 3 to h, -h to h)
-            "E" -> { val s = e / 5; listOf(-h to -h, h to -h, h to -h + s, -h + s to -h + s, -h + s to -s / 2, h * .6f to -s / 2, h * .6f to s / 2, -h + s to s / 2, -h + s to h - s, h to h - s, h to h, -h to h) }
-            else -> listOf(-h to -h, h to -h, h to h, -h to h)
-        }
-    }
+    fun outline(shape: String, e: Float): List<Pair<Float, Float>> = Catalog.polygon(shape).map { (a, b) -> a * e to b * e }
 
     fun draw(scene: Scene, placed: List<Placed>, selected: Int) {
-        for (pl in placed) {
-            val p = pl.piece; val u = pl.u; val v = pl.v
-            val color = Color(p.color)
-            val edgeColor = if (p.id == selected) Color.White else Color(lighten(p.color))
-            val thick = Catalog.THICKNESS_M * MODEL_SCALE
-            if (p.shape == "janela") {
-                val e = pl.edge; val b = e * .16f; val h = e / 2
-                listOf(
-                    listOf(-h to -h, h to -h, h to -h + b, -h to -h + b), listOf(-h to h - b, h to h - b, h to h, -h to h),
-                    listOf(-h to -h + b, -h + b to -h + b, -h + b to h - b, -h to h - b), listOf(h - b to -h + b, h to -h + b, h to h - b, h - b to h - b),
-                ).forEach { scene.prism(it, pl.center, u, v, thick, color, p.id, 1f, edgeColor) }
-                scene.shadowOf(outline("quadrado", e).map { (a, c) -> pl.center + u * a + v * c })
-            } else {
-                val o = outline(p.shape, pl.edge)
-                scene.prism(o, pl.center, u, v, thick, color, p.id, .85f, edgeColor)
-                scene.shadowOf(o.map { (a, c) -> pl.center + u * a + v * c })
-            }
-        }
+        for (pl in placed) TileMesh.build(scene, pl.piece.shape, pl.piece.size, pl.center, pl.u, pl.v, pl.edge, Color(pl.piece.color), pl.piece.id, pl.piece.id == selected)
     }
 
-    private fun lighten(c: Int): Int {
-        val hsv = FloatArray(3); AColor.colorToHSV(c, hsv); hsv[1] *= .5f; hsv[2] = min(1f, hsv[2] * 1.4f + .2f); return AColor.HSVToColor(hsv)
+    /**
+     * Garante que nenhuma peça atravessa outra nem o chão (vision/Collision). Com uma peça selecionada,
+     * só ela se mexe — é a que o usuário está empurrando.
+     */
+    fun solve(placed: List<Placed>, selected: Int): List<Placed> {
+        val bodies = placed.map { Collision.Body(it.piece.id, it.piece.shape, it.center, it.u, it.v, it.edge, fixed = selected >= 0 && it.piece.id != selected) }
+        Collision.resolve(bodies, iters = 80)
+        return placed.mapIndexed { i, pl -> pl.copy(center = bodies[i].center) }
     }
 
     /** Quatérnio (x, y, z, w) da base (u, v, n) — mesma convenção do MK-7: identidade = peça em pé de frente. */
@@ -163,9 +145,9 @@ object Layout {
     }
 
     fun json(placed: List<Placed>): String {
-        val root = JSONObject().put("format", "Brastoy").put("version", 4).put("inventoryMode", "unlimited")
-            .put("unitMeters", Math.round(1e5 / MODEL_SCALE) / 1e5)
-            .put("source", "BraScan: posições estimadas (foto ou scanner 3D); confira no MK-7")
+        // Mesmo formato do simulador (projectData): items[{type,size,color,pos,rot}], unidade = lado do quadrado grande.
+        val root = JSONObject().put("format", "Brastoy").put("version", 1).put("inventoryMode", "unlimited")
+            .put("source", "BraScan: posições estimadas (foto ou scanner 3D)")
         val arr = JSONArray()
         for (pl in placed) {
             fun r(v: Float) = Math.round(v * 1000) / 1000.0
@@ -174,32 +156,19 @@ object Layout {
                 .put("pos", JSONArray().put(r(pl.center.x)).put(r(pl.center.y)).put(r(pl.center.z)))
                 .put("rot", JSONArray(quat(pl.u, pl.v, pl.n))))
         }
-        return root.put("pieces", arr).toString(2)
+        return root.put("items", arr).toString(2)
     }
 }
 
-/** Foto → peças: segmentação + classificação geométrica (vision/), tamanho relativo à mediana. */
+/** Foto → peças: segmentação + classificação geométrica (vision/), tamanho relativo ao quadrado grande. */
 object Detector {
     fun detect(src: Bitmap, startId: Int): List<Piece> {
-        val w = 320; val h = max(1, (src.height * w.toFloat() / src.width).toInt())
+        val w = 400; val h = max(1, (src.height * w.toFloat() / src.width).toInt())
         val b = Bitmap.createScaledBitmap(src, w, h, true)
         val px = IntArray(w * h); b.getPixels(px, 0, w, 0, 0, w, h)
-        val seg = Segmenter.segment(px, w, h, maxBlobs = 60)
-        if (seg.blobs.isEmpty()) return emptyList()
-        val med = seg.blobs.map { sqrt(it.count.toFloat()) }.sorted()[seg.blobs.size / 2]
         var id = startId
-        return seg.blobs.map { bl ->
-            val fit = bl.fit
-            val shape = fit?.shape ?: "quadrado"
-            // giro no plano: triângulos pelo vértice; o resto pelo retângulo mínimo (encaixado em 0°/90° se perto)
-            val spin = when {
-                fit == null -> 0f
-                shape == "equilatero" || shape == "retanguloTri" -> { val a = fit.obb.vy * (if (fit.apexPositive) 1f else -1f); atan2(-a.x, -a.y) }
-                else -> { val q = (Math.PI / 2).toFloat(); val a = -fit.obb.angle; val r = Math.round(a / q) * q; if (abs(a - r) < .26f) 0f else a - r }
-            }
-            val rel = sqrt(bl.count.toFloat()) / med
-            Piece(id++, (bl.minX + bl.bw / 2f) / w, (bl.minY + bl.bh / 2f) / h, bl.bw.toFloat() / w, bl.bh.toFloat() / h, shape,
-                size = when { rel < .75f -> "pequeno"; rel > 1.3f -> "grande"; else -> "medio" }, color = bl.color, spin = spin)
+        return PhotoPieces.from(Segmenter.segment(px, w, h, maxBlobs = 60)).map { d ->
+            Piece(id++, d.cx / w, d.cy / h, d.w / w, d.h / h, d.shape, size = d.size, color = d.color, spin = d.spin, spinTop = d.spinTop)
         }
     }
 }

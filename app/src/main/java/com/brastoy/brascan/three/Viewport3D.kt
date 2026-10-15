@@ -83,12 +83,15 @@ fun Viewport3D(
     }
 }
 
-/** Piso quadriculado + eixos, usado em todas as cenas. */
-fun Scene.floorGrid(half: Int = 5, step: Float = 1f, color: Color = Color(0x3355AAFF)) {
-    for (i in -half..half) {
-        val k = i * step; val e = half * step
-        under += Line3(V3(k, 0f, -e), V3(k, 0f, e), if (i == 0) Color(0x6655AAFF) else color, 1.2f)
-        under += Line3(V3(-e, 0f, k), V3(e, 0f, k), if (i == 0) Color(0x6655AAFF) else color, 1.2f)
+/** Piso quadriculado que some com a distância (névoa), usado em todas as cenas. */
+fun Scene.floorGrid(half: Int = 5, step: Float = 1f, color: Color = Color(0xFF55AAFF)) {
+    val e = half * step
+    for (i in -half..half) for (j in -half until half) {
+        val k = i * step; val a = j * step; val b = a + step
+        val fade = (1f - kotlin.math.max(kotlin.math.abs(k), kotlin.math.abs(a + step / 2)) / e).coerceIn(0f, 1f)
+        val c = color.copy(alpha = (if (i == 0) .4f else .22f) * fade * fade)
+        under += Line3(V3(k, 0f, a), V3(k, 0f, b), c, 1.2f)
+        under += Line3(V3(a, 0f, k), V3(b, 0f, k), c, 1.2f)
     }
 }
 

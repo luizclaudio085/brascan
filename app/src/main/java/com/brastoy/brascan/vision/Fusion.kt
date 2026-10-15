@@ -159,12 +159,13 @@ class FusionMap(val cell: Float = .006f) {
         val out = ArrayList<Piece3D>()
         for (island in m.components(minCells = 20)) {
             val fit = ShapeClassifier.classify(island.erode().takeIf { it.count() >= 10 } ?: island) ?: continue
+            val tri = fit.shape == "equilatero" || fit.shape == "retanguloTri" || fit.shape == "isoceles"
             var ang = fit.obb.angle
             if (abs(n.dot(up)) < .9f) ang = Snap.angle(ang) // paredes: bordas alinhadas à vertical
             val ux = P2(kotlin.math.cos(ang), kotlin.math.sin(ang)); val vy = P2(-ux.y, ux.x)
             val u = (u0 * ux.x + v0 * ux.y).norm(); var v = (u0 * vy.x + v0 * vy.y).norm()
             var uu = u
-            if (fit.shape == "equilatero" || fit.shape == "retanguloTri") {
+            if (tri) {
                 // Vira a peça se o vértice aponta para -v (mantendo a base destra).
                 val apex = fit.obb.vy * (if (fit.apexPositive) 1f else -1f)
                 if (apex.dot(vy) < 0) { v = v * -1f; uu = uu * -1f }
@@ -173,13 +174,12 @@ class FusionMap(val cell: Float = .006f) {
             // a borda escura (sem cor) a emagrece. o = deslocamento líquido de cada lado.
             val full = Geo2.minAreaRect(Geo2.hull(island.edgePoints()))
             val o = Catalog.FRAME_M - res - cell * .25f
-            val tri = fit.shape == "equilatero" || fit.shape == "retanguloTri"
             val wM = full.w * res + o * (if (tri) 3.46f else 2f); val hM = full.h * res + o * (if (tri) 3f else 2f)
             var oc = fit.obb.c
-            // Triângulos: o "centro" da peça é o baricentro (1/3 da altura a partir da base), não o centro da caixa.
-            if (tri) oc = oc - fit.obb.vy * ((if (fit.apexPositive) 1f else -1f) * fit.obb.h / 6f)
+            // Triângulos: o pivô do simulador não é o centro da caixa (equilátero: baricentro; isósceles: meio do quadrado da base).
+            if (tri) oc = oc + fit.obb.vy * ((if (fit.apexPositive) 1f else -1f) * Catalog.pivotOffset(fit.shape) * fit.obb.h)
             val cc = c + u0 * (oc.x * res + minX - res) + v0 * (oc.y * res + minY - res)
-            val edge = when (fit.shape) { "retangulo" -> hM; "equilatero" -> max(wM, hM / .866f); else -> max(wM, hM) }
+            val edge = Catalog.sideFromBox(fit.shape, wM, hM)
             out += Piece3D(fit.shape, Catalog.sizeFor(edge), color, cc, uu, v, uu.cross(v).norm(), wM, hM, island.count())
         }
         return out

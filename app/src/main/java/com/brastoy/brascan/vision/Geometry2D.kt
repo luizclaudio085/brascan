@@ -124,6 +124,9 @@ class Mask(val w: Int, val h: Int, val bits: BooleanArray = BooleanArray(w * h))
     }
 }
 
+/** Vão dentro do casco: centro e extensão normalizados no sistema do OBB (-0,5..0,5), área relativa ao casco. */
+data class Gap(val cu: Float, val cv: Float, val su: Float, val sv: Float, val area: Float, val enclosed: Boolean)
+
 data class ShapeFit(
     val shape: String,
     val obb: OBB,
@@ -132,12 +135,9 @@ data class ShapeFit(
     val apexPositive: Boolean = true,
     val solidity: Float,
     val rectangularity: Float,
+    val gaps: List<Gap> = emptyList(),
 )
 
-/**
- * Classifica a forma por geometria: solidez (área / casco), retangularidade (casco / retângulo mínimo),
- * número de cantos do casco e quais lados do retângulo estão preenchidos (anel = janela, 2 lados = L, 3 = E).
- */
 object ShapeClassifier {
     fun classify(m: Mask): ShapeFit? {
         val cells = m.count(); if (cells < 6) return null
@@ -154,27 +154,42 @@ object ShapeClassifier {
             for (dx in -1..1) for (dy in -1..1) if (m[(p.x + dx).toInt(), (p.y + dy).toInt()]) hit++
             return hit >= 3
         }
-        val (holes, notches) = gaps(m, hull, hullA)
+        // faixa fina colada na borda = borda/ímã que não foi segmentado, não é forma da peça
+        val gaps = gaps(m, hull, hullA, obb).filterNot { g -> (g.su < .2f && abs(g.cu) > .33f) || (g.sv < .2f && abs(g.cv) > .33f) }
+        val holes = gaps.filter { it.enclosed }; val notches = gaps.filter { !it.enclosed }
+        val tri = corners.size == 3 || (rect < .7f && solidity > .8f)
 
         val shape = when {
-            holes >= 1 && solidity < .85f -> "janela"
-            notches >= 2 && solidity < .88f -> "E"
-            notches == 1 && solidity < .88f && rect > .6f -> "L"
-            corners.size == 3 || (rect < .68f && solidity > .82f) -> triangleKind(corners)
+            holes.size >= 3 -> "janela" // janela de 4 vidros
+            holes.isNotEmpty() && solidity < .9f -> {
+                val g = holes.maxBy { it.area }
+                val elong = max(g.su, g.sv) / max(min(g.su, g.sv), 1e-3f)
+                if (elong > 1.2f || hypotF(g.cu, g.cv) > .09f) "porta" else "moldura"
+            }
+            tri && solidity > .8f -> triangleKind(corners, aspect)
+            notches.count { it.area > .05f } >= 2 && solidity < .85f -> "E"
+            notches.size == 1 && solidity < .9f && !tri -> {
+                // L: vão no canto (centro em diagonal); porta sem soleira: vão no meio de um lado
+                val g = notches[0]; val lo = minOf(abs(g.cu), abs(g.cv)); val hi = maxOf(abs(g.cu), abs(g.cv))
+                if (lo > .035f && hi < lo * 2.2f) "L" else "porta"
+            }
+            tri -> triangleKind(corners, aspect)
             aspect > 1.55f -> "retangulo"
             else -> "quadrado"
         }
         // Centroide abaixo do centro do OBB (no eixo v) → base embaixo, vértice para +v.
         var sv = 0.0; var n = 0
         for (y in 0 until m.h) for (x in 0 until m.w) if (m[x, y]) { sv += (P2(x + .5f, y + .5f) - obb.c).dot(obb.vy); n++ }
-        return ShapeFit(shape, obb, corners, apexPositive = sv / max(1, n) < 0, solidity = solidity, rectangularity = rect)
+        return ShapeFit(shape, obb, corners, apexPositive = sv / max(1, n) < 0, solidity = solidity, rectangularity = rect, gaps = gaps)
     }
 
     /**
      * Vãos dentro do casco convexo: os fechados são furos (janela), os que encostam na borda do casco
      * são entalhes (L tem 1, E tem 2). Vãos menores que 4% do casco são ruído.
      */
-    private fun gaps(m: Mask, hull: List<P2>, hullA: Float): Pair<Int, Int> {
+    private fun hypotF(a: Float, b: Float) = kotlin.math.sqrt(a * a + b * b)
+
+    private fun gaps(m: Mask, hull: List<P2>, hullA: Float, obb: OBB): List<Gap> {
         fun inHull(x: Float, y: Float): Boolean {
             for (i in hull.indices) if ((hull[(i + 1) % hull.size] - hull[i]).cross(P2(x, y) - hull[i]) < 0) return false
             return true
@@ -182,17 +197,86 @@ object ShapeClassifier {
         val gap = Mask(m.w, m.h)
         val hullCell = Mask(m.w, m.h)
         for (y in 0 until m.h) for (x in 0 until m.w) if (inHull(x + .5f, y + .5f)) { hullCell[x, y] = true; if (!m[x, y]) gap[x, y] = true }
-        var holes = 0; var notches = 0
-        for (c in gap.erode().dilate().components(minCells = max(3, (hullA * .04f).toInt()))) {
+        val out = ArrayList<Gap>()
+        for (c in gap.erode().dilate().components(minCells = max(3, (hullA * .025f).toInt()))) {
             var touches = false
-            loop@ for (y in 0 until c.h) for (x in 0 until c.w) if (c[x, y] && (!hullCell[x - 1, y] || !hullCell[x + 1, y] || !hullCell[x, y - 1] || !hullCell[x, y + 1])) { touches = true; break@loop }
-            if (touches) notches++ else holes++
+            var su0 = Float.MAX_VALUE; var su1 = -Float.MAX_VALUE; var sv0 = Float.MAX_VALUE; var sv1 = -Float.MAX_VALUE; var cu = 0f; var cv = 0f; var k = 0
+            for (y in 0 until c.h) for (x in 0 until c.w) if (c[x, y]) {
+                if (!hullCell[x - 1, y] || !hullCell[x + 1, y] || !hullCell[x, y - 1] || !hullCell[x, y + 1]) touches = true
+                val d = P2(x + .5f, y + .5f) - obb.c
+                val u = d.dot(obb.ux) / max(obb.w, 1f); val v = d.dot(obb.vy) / max(obb.h, 1f)
+                su0 = min(su0, u); su1 = max(su1, u); sv0 = min(sv0, v); sv1 = max(sv1, v); cu += u; cv += v; k++
+            }
+            out += Gap(cu / k, cv / k, su1 - su0, sv1 - sv0, k / max(hullA, 1f), enclosed = !touches)
         }
-        return holes to notches
+        return out
     }
 
-    private fun triangleKind(corners: List<P2>): String {
-        if (corners.size != 3) return "equilatero"
-        return if (Geo2.angles(corners).max() > 78f) "retanguloTri" else "equilatero"
+    /** Pelos ângulos: 90° = triângulo retângulo; ângulo agudo (< 45°) = isósceles alto; senão equilátero. */
+    private fun triangleKind(corners0: List<P2>, aspect: Float): String {
+        // tira "cantos" quase retos (sobras da simplificação) até sobrar o triângulo
+        val corners = corners0.toMutableList()
+        while (corners.size > 3) { val a = Geo2.angles(corners); val i = a.indices.maxBy { a[it] }; if (a[i] < 150f) break; corners.removeAt(i) }
+        if (corners.size != 3) return if (aspect > 1.6f) "isoceles" else "equilatero"
+        val ang = Geo2.angles(corners)
+        return when { ang.max() > 78f -> "retanguloTri"; ang.min() < 45f -> "isoceles"; else -> "equilatero" }
+    }
+}
+
+/**
+ * Encaixa o molde exato da peça (polígono + furos do catálogo) na máscara, testando as 4 rotações alinhadas
+ * ao retângulo mínimo; devolve o ângulo (rad, coordenadas da imagem) do eixo +u do molde e o IoU.
+ * [vUp]: o eixo +v do molde aponta para cima na imagem (foto de frente) ou para baixo (foto de cima).
+ */
+object TemplateFit {
+    private fun inPoly(p: List<Pair<Float, Float>>, x: Float, y: Float): Boolean {
+        var c = false; var j = p.size - 1
+        for (i in p.indices) { val (xi, yi) = p[i]; val (xj, yj) = p[j]; if ((yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) c = !c; j = i }
+        return c
+    }
+
+    /** Área e centroide de polígono (shoelace), com furos subtraídos. */
+    private fun areaCentroid(poly: List<Pair<Float, Float>>, holes: List<List<Pair<Float, Float>>>): Triple<Float, Float, Float> {
+        fun one(p: List<Pair<Float, Float>>): Triple<Float, Float, Float> {
+            var a = 0f; var cx = 0f; var cy = 0f
+            for (i in p.indices) { val (x0, y0) = p[i]; val (x1, y1) = p[(i + 1) % p.size]; val c = x0 * y1 - x1 * y0; a += c; cx += (x0 + x1) * c; cy += (y0 + y1) * c }
+            a /= 2; return Triple(abs(a), cx / (6 * a), cy / (6 * a))
+        }
+        val (ao, xo, yo) = one(poly); var A = ao; var X = xo * ao; var Y = yo * ao
+        for (h in holes) { val (ah, xh, yh) = one(h); A -= ah; X -= xh * ah; Y -= yh * ah }
+        return Triple(A, X / A, Y / A)
+    }
+
+    fun fit(m: Mask, obb: OBB, shape: String, vUp: Boolean, corners: List<P2> = emptyList()): Pair<Float, Float> {
+        val poly = Catalog.polygon(shape); val holes = Catalog.holes(shape)
+        val (pa, pcx, pcy) = areaCentroid(poly, holes)
+        // escala única pela área; centroides alinhados
+        var n = 0; var mx = 0f; var my = 0f
+        for (y in 0 until m.h) for (x in 0 until m.w) if (m[x, y]) { n++; mx += x + .5f; my += y + .5f }
+        if (n == 0) return 0f to 0f
+        val c = P2(mx / n, my / n); val sc = kotlin.math.sqrt(n / pa)
+        var best = 0f; var bestIou = -1f
+        // candidatos: múltiplos de 45° do retângulo mínimo + direções dos lados da peça (triângulos empatam a caixa em todo lado)
+        val q = (Math.PI / 2).toFloat()
+        // peças com simetria de 90° só giram alinhadas ao retângulo mínimo (a diagonal empata por ruído)
+        val square = shape in setOf("quadrado", "moldura", "janela", "encaixe")
+        val cands = if (square) (0 until 4).map { obb.angle + it * q } else (0 until 8).map { obb.angle + it * (Math.PI / 4).toFloat() } +
+            corners.indices.flatMap { i -> val e = corners[(i + 1) % corners.size] - corners[i]; val a = kotlin.math.atan2(e.y, e.x); (0 until 4).map { a + it * q } }
+        for (th in cands) {
+            val U = P2(cos(th), sin(th)); val V = if (vUp) P2(sin(th), -cos(th)) else P2(-sin(th), cos(th))
+            var inter = 0; var union = 0
+            val pad = (sc * .3f).toInt() + 2
+            for (y in -pad until m.h + pad) for (x in -pad until m.w + pad) {
+                val d = P2(x + .5f, y + .5f) - c
+                val a = pcx + d.dot(U) / sc; val b = pcy + d.dot(V) / sc
+                val t = inPoly(poly, a, b) && holes.none { inPoly(it, a, b) }
+                val mm = m[x, y]
+                if (t && mm) inter++
+                if (t || mm) union++
+            }
+            val iou = inter / max(1, union).toFloat()
+            if (iou > bestIou + 1e-4f) { bestIou = iou; best = th }
+        }
+        return best to bestIou
     }
 }

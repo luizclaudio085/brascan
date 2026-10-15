@@ -38,6 +38,10 @@ class MsaaChooser : GLSurfaceView.EGLConfigChooser {
 class OrbitGlView(ctx: Context) : GLSurfaceView(ctx), GLSurfaceView.Renderer {
     var camera = Camera()
     var build: (Scene) -> Unit = {}
+    /** A cena só é refeita quando a chave muda (peças, seleção…); girar a câmera não reconstrói nada. */
+    @Volatile var key: Any? = Unit
+    private var builtKey: Any? = null
+    private var scene: Scene = Scene()
     var autoRotate = true
     @Volatile var lastTouch = 0L
     @Volatile var lastScene: Scene = Scene()
@@ -62,7 +66,8 @@ class OrbitGlView(ctx: Context) : GLSurfaceView(ctx), GLSurfaceView.Renderer {
         GLES20.glClearColor(.02f, .03f, .06f, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
         gl.background(0x0B1730, 0x04070E)
-        val scene = Scene().also(build)
+        val k = key
+        if (k != builtKey || builtKey == null) { scene = Scene().also(build); builtKey = k ?: Any() }
         lastScene = scene
         gl.orbit(camera, w, h, view, proj)
         gl.draw(scene, view, proj, camera.eye())
@@ -76,7 +81,7 @@ class OrbitGlView(ctx: Context) : GLSurfaceView(ctx), GLSurfaceView.Renderer {
 }
 
 @Composable
-fun GlViewport(modifier: Modifier, camera: Camera, autoRotate: Boolean = true, onTap: ((Int) -> Unit)? = null, build: (Scene) -> Unit) {
+fun GlViewport(modifier: Modifier, camera: Camera, key: Any?, autoRotate: Boolean = true, onTap: ((Int) -> Unit)? = null, build: (Scene) -> Unit) {
     val buildState = rememberUpdatedState(build)
     val tapState = rememberUpdatedState(onTap)
     val home = remember { Triple(camera.yaw, camera.pitch, camera.distance) }
@@ -84,7 +89,7 @@ fun GlViewport(modifier: Modifier, camera: Camera, autoRotate: Boolean = true, o
     Box(modifier) {
         AndroidView(
             factory = { ctx -> OrbitGlView(ctx).also { it.camera = camera; ref[0] = it } },
-            update = { it.camera = camera; it.autoRotate = autoRotate; it.build = { s -> buildState.value(s) }; ref[0] = it },
+            update = { it.camera = camera; it.autoRotate = autoRotate; it.build = { s -> buildState.value(s) }; it.key = key; ref[0] = it },
             modifier = Modifier.fillMaxSize(),
         )
         Box(

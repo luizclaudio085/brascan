@@ -6,14 +6,29 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.sin
 
 /**
- * Desenha uma [Scene] com OpenGL ES 2: z-buffer (sem os erros de ordem do Canvas),
- * iluminação difusa + contorno, sombras no chão, linhas e pontos. Usado pela aba 3D e pelo AR.
+ * Desenha uma [Scene] com OpenGL ES 2: z-buffer, plástico translúcido (Blinn-Phong + Fresnel + luz de céu),
+ * sombra suave (várias amostras), contornos e pontos. A cena é preparada uma vez (arrays prontos) e só a
+ * ordem dos translúcidos é refeita por quadro. Usado pela aba 3D e pelo AR.
  */
 class GlSceneRenderer {
     private var mesh = 0; private var flat = 0
     private val mvp = FloatArray(16)
+    private var buf: FloatBuffer = ByteBuffer.allocateDirect(4 * 4096).order(ByteOrder.nativeOrder()).asFloatBuffer()
+
+    private class Prepared(
+        val opaque: FloatArray,
+        val clear: List<Pair<V3, FloatArray>>,
+        val shadows: FloatArray,
+        val under: FloatArray, val underWidth: Float,
+        val lines: FloatArray, val lineWidth: Float,
+    )
+    private var preparedFor: Scene? = null
+    private var prepared: Prepared? = null
+    private var scratch = FloatArray(0)
 
     fun init() {
         mesh = program(
@@ -23,14 +38,18 @@ class GlSceneRenderer {
             void main(){ vNor=aNor; vCol=aCol; vPos=aPos; gl_Position=uMVP*vec4(aPos,1.0); }
             """,
             """
-            precision mediump float; uniform vec3 uLight; uniform vec3 uEye;
+            precision mediump float; uniform vec3 uLight; uniform vec3 uLight2; uniform vec3 uEye;
             varying vec3 vNor; varying vec4 vCol; varying vec3 vPos;
             void main(){
               vec3 n=normalize(vNor); vec3 e=normalize(uEye-vPos); if(dot(n,e)<0.0) n=-n;
-              float d=max(dot(n,normalize(uLight)),0.0);
-              float rim=pow(1.0-max(dot(n,e),0.0),3.0)*0.35;
-              vec3 c=vCol.rgb*(0.40+0.60*d)+vec3(rim);
-              gl_FragColor=vec4(c,vCol.a);
+              vec3 l=normalize(uLight); vec3 h=normalize(l+e);
+              float d=max(dot(n,l),0.0); float d2=max(dot(n,normalize(uLight2)),0.0)*0.30;
+              float spec=pow(max(dot(n,h),0.0),70.0)*0.65;
+              float hemi=mix(0.30,0.52,n.y*0.5+0.5);
+              float fres=pow(1.0-max(dot(n,e),0.0),3.0);
+              vec3 c=vCol.rgb*(hemi+0.58*d+d2)+vec3(spec)+vec3(0.16)*fres;
+              float a=clamp(vCol.a+fres*0.35+spec*0.6,0.0,1.0);
+              gl_FragColor=vec4(pow(c,vec3(0.92)),a);
             }
             """,
         )
@@ -47,68 +66,75 @@ class GlSceneRenderer {
     fun orbit(cam: Camera, w: Int, h: Int, view: FloatArray, proj: FloatArray) {
         val e = cam.eye()
         Matrix.setLookAtM(view, 0, e.x, e.y, e.z, cam.target.x, cam.target.y, cam.target.z, 0f, 1f, 0f)
-        Matrix.perspectiveM(proj, 0, Math.toDegrees(cam.fov.toDouble()).toFloat(), w.toFloat() / h, .05f, 200f)
+        Matrix.perspectiveM(proj, 0, Math.toDegrees(cam.fov.toDouble()).toFloat(), w.toFloat() / h, .02f, 200f)
+    }
+
+    private fun prepare(scene: Scene): Prepared {
+        fun faceData(f: Face): FloatArray {
+            val nrm = Triangulate.normal(f.pts)
+            val tris = Triangulate.polygon(f.pts)
+            val out = FloatArray(tris.size * 30); var j = 0
+            for (t in tris) for (p in t) { out[j++] = p.x; out[j++] = p.y; out[j++] = p.z; out[j++] = nrm.x; out[j++] = nrm.y; out[j++] = nrm.z; out[j++] = f.color.red; out[j++] = f.color.green; out[j++] = f.color.blue; out[j++] = f.alpha }
+            return out
+        }
+        val opaque = ArrayList<FloatArray>(); val clear = ArrayList<Pair<V3, FloatArray>>()
+        for (f in scene.faces) {
+            val d = faceData(f)
+            if (f.alpha >= .99f) opaque += d else clear += (f.pts.fold(V3.ZERO) { a, b -> a + b } * (1f / f.pts.size)) to d
+        }
+        // sombra suave: o mesmo polígono deslocado em círculo, cada cópia bem clara
+        val soft = scene.shadowSoftness; val k = 7
+        val tris = scene.shadows.flatMap { Triangulate.polygon(it) }
+        val sh = FloatArray(tris.size * k * 3 * 7); var q = 0
+        for (t in tris) for (i in 0 until k) {
+            val a = i * 2 * Math.PI / k; val r = if (i == 0) 0f else soft
+            val ox = (cos(a) * r).toFloat(); val oz = (sin(a) * r).toFloat()
+            for (p in t) { sh[q++] = p.x + ox; sh[q++] = p.y; sh[q++] = p.z + oz; sh[q++] = 0f; sh[q++] = 0f; sh[q++] = 0f; sh[q++] = scene.shadowAlpha / k * 1.6f }
+        }
+        fun lineData(ls: List<Line3>): FloatArray {
+            val d = FloatArray(ls.size * 14); var j = 0
+            for (l in ls) for (p in listOf(l.a, l.b)) { d[j++] = p.x; d[j++] = p.y; d[j++] = p.z; d[j++] = l.color.red; d[j++] = l.color.green; d[j++] = l.color.blue; d[j++] = l.color.alpha }
+            return d
+        }
+        val outline = ArrayList<Line3>()
+        for (f in scene.faces) f.outline?.let { c -> for (i in f.pts.indices) outline += Line3(f.pts[i], f.pts[(i + 1) % f.pts.size], c, 2f) }
+        val all = outline + scene.lines
+        val op = FloatArray(opaque.sumOf { it.size }); var o = 0
+        for (d in opaque) { System.arraycopy(d, 0, op, o, d.size); o += d.size }
+        return Prepared(op, clear, sh, lineData(scene.under), scene.under.maxOfOrNull { it.width } ?: 1f, lineData(all), all.maxOfOrNull { it.width } ?: 1f)
     }
 
     fun draw(scene: Scene, view: FloatArray, proj: FloatArray, eye: V3, points: List<Pair<V3, Int>> = emptyList(), pointSize: Float = 6f) {
+        if (preparedFor !== scene) { prepared = prepare(scene); preparedFor = scene }
+        val p = prepared!!
         Matrix.multiplyMM(mvp, 0, proj, 0, view, 0)
         GLES20.glEnable(GLES20.GL_DEPTH_TEST)
         GLES20.glEnable(GLES20.GL_BLEND)
         GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
 
-        // chão e sombras: sem escrever profundidade, para não brigar com as peças
+        // chão e sombras sem escrever profundidade
         GLES20.glDepthMask(false)
-        drawLines(scene.under)
-        if (scene.shadows.isNotEmpty()) {
-            val tris = ArrayList<Float>()
-            for (s in scene.shadows) for (t in Triangulate.polygon(s)) for (p in t) { tris += p.x; tris += p.y; tris += p.z; tris += 0f; tris += 1f; tris += 0f; tris += 0f; tris += 0f; tris += 0f; tris += .35f }
-            drawTris(tris.toFloatArray(), flatShade = true)
-        }
+        if (p.under.isNotEmpty()) { GLES20.glLineWidth(p.underWidth); flatDraw(p.under, GLES20.GL_LINES, 1f) }
+        if (p.shadows.isNotEmpty()) flatDraw(p.shadows, GLES20.GL_TRIANGLES, 1f)
         GLES20.glDepthMask(true)
 
-        // peças opacas primeiro, translúcidas depois (de trás para frente)
-        val opaque = ArrayList<Float>(); val clear = ArrayList<Pair<Float, FloatArray>>()
-        for (f in scene.faces) {
-            val nrm = Triangulate.normal(f.pts)
-            val buf = ArrayList<Float>()
-            for (t in Triangulate.polygon(f.pts)) for (p in t) { buf += p.x; buf += p.y; buf += p.z; buf += nrm.x; buf += nrm.y; buf += nrm.z; buf += f.color.red; buf += f.color.green; buf += f.color.blue; buf += f.alpha }
-            if (f.alpha >= .99f) opaque.addAll(buf) else {
-                val c = f.pts.fold(V3.ZERO) { a, b -> a + b } * (1f / f.pts.size)
-                clear += (c - eye).len() to buf.toFloatArray()
-            }
-        }
-        drawTris(opaque.toFloatArray(), eye = eye)
-        if (clear.isNotEmpty()) {
+        meshDraw(p.opaque, p.opaque.size, eye)
+        if (p.clear.isNotEmpty()) {
+            // translúcidos de trás para frente, sem escrever profundidade (o de trás aparece através)
+            val order = p.clear.sortedByDescending { (it.first - eye).len() }
+            val total = order.sumOf { it.second.size }
+            if (scratch.size < total) scratch = FloatArray(total)
+            var j = 0; for ((_, d) in order) { System.arraycopy(d, 0, scratch, j, d.size); j += d.size }
             GLES20.glDepthMask(false)
-            drawTris(clear.sortedByDescending { it.first }.flatMap { it.second.asList() }.toFloatArray(), eye = eye)
+            meshDraw(scratch, total, eye)
             GLES20.glDepthMask(true)
         }
-
-        // contornos das peças por cima com leve deslocamento
-        val outline = ArrayList<Line3>()
-        for (f in scene.faces) f.outline?.let { c -> for (i in f.pts.indices) outline += Line3(f.pts[i], f.pts[(i + 1) % f.pts.size], c, 2f) }
-        drawLines(outline + scene.lines)
-        if (points.isNotEmpty()) drawPoints(points, pointSize)
-    }
-
-    private fun drawTris(data: FloatArray, flatShade: Boolean = false, eye: V3 = V3.ZERO) {
-        if (data.isEmpty()) return
-        if (flatShade) {
-            // reaproveita o programa de linhas: só posição + cor
-            val d = FloatArray(data.size / 10 * 7)
-            var j = 0
-            for (i in data.indices step 10) { d[j++] = data[i]; d[j++] = data[i + 1]; d[j++] = data[i + 2]; d[j++] = data[i + 6]; d[j++] = data[i + 7]; d[j++] = data[i + 8]; d[j++] = data[i + 9] }
-            flatDraw(d, GLES20.GL_TRIANGLES, 1f); return
+        if (p.lines.isNotEmpty()) { GLES20.glLineWidth(p.lineWidth.coerceIn(1f, 6f)); flatDraw(p.lines, GLES20.GL_LINES, 1f) }
+        if (points.isNotEmpty()) {
+            val d = FloatArray(points.size * 7); var j = 0
+            for ((q, c) in points) { d[j++] = q.x; d[j++] = q.y; d[j++] = q.z; d[j++] = (c shr 16 and 255) / 255f; d[j++] = (c shr 8 and 255) / 255f; d[j++] = (c and 255) / 255f; d[j++] = 1f }
+            flatDraw(d, GLES20.GL_POINTS, pointSize)
         }
-        GLES20.glUseProgram(mesh)
-        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(mesh, "uMVP"), 1, false, mvp, 0)
-        GLES20.glUniform3f(GLES20.glGetUniformLocation(mesh, "uLight"), -.45f, .85f, .35f)
-        GLES20.glUniform3f(GLES20.glGetUniformLocation(mesh, "uEye"), eye.x, eye.y, eye.z)
-        val fb = buffer(data)
-        val stride = 10 * 4
-        attr(mesh, "aPos", fb, 0, 3, stride); attr(mesh, "aNor", fb, 3, 3, stride); attr(mesh, "aCol", fb, 6, 4, stride)
-        GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, data.size / 10)
-        disableAll()
     }
 
     /** Fundo em degradê (coordenadas de tela, sem profundidade). */
@@ -121,25 +147,30 @@ class GlSceneRenderer {
         flatDraw(d, GLES20.GL_TRIANGLES, 1f)
     }
 
-    private fun drawLines(lines: List<Line3>) {
-        if (lines.isEmpty()) return
-        val d = FloatArray(lines.size * 14); var j = 0
-        for (l in lines) for (p in listOf(l.a, l.b)) { d[j++] = p.x; d[j++] = p.y; d[j++] = p.z; d[j++] = l.color.red; d[j++] = l.color.green; d[j++] = l.color.blue; d[j++] = l.color.alpha }
-        GLES20.glLineWidth(lines.maxOf { it.width }.coerceIn(1f, 8f))
-        flatDraw(d, GLES20.GL_LINES, 1f)
+    private fun upload(d: FloatArray, n: Int): FloatBuffer {
+        if (buf.capacity() < n) buf = ByteBuffer.allocateDirect(n * 4 * 2).order(ByteOrder.nativeOrder()).asFloatBuffer()
+        buf.clear(); buf.put(d, 0, n); buf.position(0)
+        return buf
     }
 
-    private fun drawPoints(pts: List<Pair<V3, Int>>, size: Float) {
-        val d = FloatArray(pts.size * 7); var j = 0
-        for ((p, c) in pts) { d[j++] = p.x; d[j++] = p.y; d[j++] = p.z; d[j++] = (c shr 16 and 255) / 255f; d[j++] = (c shr 8 and 255) / 255f; d[j++] = (c and 255) / 255f; d[j++] = 1f }
-        flatDraw(d, GLES20.GL_POINTS, size)
+    private fun meshDraw(data: FloatArray, n: Int, eye: V3) {
+        if (n == 0) return
+        GLES20.glUseProgram(mesh)
+        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(mesh, "uMVP"), 1, false, mvp, 0)
+        GLES20.glUniform3f(GLES20.glGetUniformLocation(mesh, "uLight"), -.45f, .85f, .35f)
+        GLES20.glUniform3f(GLES20.glGetUniformLocation(mesh, "uLight2"), .6f, .3f, -.5f)
+        GLES20.glUniform3f(GLES20.glGetUniformLocation(mesh, "uEye"), eye.x, eye.y, eye.z)
+        val fb = upload(data, n)
+        attr(mesh, "aPos", fb, 0, 3, 40); attr(mesh, "aNor", fb, 3, 3, 40); attr(mesh, "aCol", fb, 6, 4, 40)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, n / 10)
+        disableAll()
     }
 
     private fun flatDraw(d: FloatArray, mode: Int, size: Float) {
         GLES20.glUseProgram(flat)
         GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(flat, "uMVP"), 1, false, mvp, 0)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(flat, "uSize"), size)
-        val fb = buffer(d)
+        val fb = upload(d, d.size)
         attr(flat, "aPos", fb, 0, 3, 28); attr(flat, "aCol", fb, 3, 4, 28)
         GLES20.glDrawArrays(mode, 0, d.size / 7)
         disableAll()
@@ -183,7 +214,6 @@ object Triangulate {
         if (p.size < 3) return emptyList()
         if (p.size == 3) return listOf(p)
         val n = normal(p)
-        // projeta no eixo dominante
         val ax = abs(n.x); val ay = abs(n.y); val az = abs(n.z)
         val pts = p.map { when { ax >= ay && ax >= az -> floatArrayOf(it.y, it.z); ay >= az -> floatArrayOf(it.z, it.x); else -> floatArrayOf(it.x, it.y) } }
         fun cross(o: FloatArray, a: FloatArray, b: FloatArray) = (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])

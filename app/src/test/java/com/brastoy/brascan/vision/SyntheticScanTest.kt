@@ -28,8 +28,8 @@ class SyntheticScanTest {
         Tile("azul em pé de lado", "quadrado", 0xFF2F8CFF.toInt(), V3(hh + .004f, hh, -hh - .004f), Z * -1f, Y, ::sq),
         Tile("amarelo deitado", "quadrado", 0xFFFFC531.toInt(), V3(.13f, .003f, .06f), X, Z * -1f, ::sq),
         Tile("triângulo verde em cima", "equilatero", 0xFF2EC27E.toInt(), V3(0f, e + .002f + t / 3, 0f), X, Y) { a, b -> b > -t / 3 && b < 2 * t / 3 && abs(a) < (2 * t / 3 - b) / 1.732f },
-        Tile("retângulo roxo", "retangulo", 0xFF9B5DE5.toInt(), V3(-.17f, hh, .05f), X, Y) { a, b -> abs(a) < e && abs(b) < hh },
-        Tile("janela laranja", "janela", 0xFFFF7A2F.toInt(), V3(-.07f, hh, .16f), Z, Y) { a, b -> sq(a, b) && !(abs(a) < hh * .62f && abs(b) < hh * .62f) },
+        Tile("retângulo roxo", "retangulo", 0xFF9B5DE5.toInt(), V3(-.17f, e / 4, .05f), X, Y) { a, b -> abs(a) < hh && abs(b) < e / 4 },
+        Tile("moldura laranja", "moldura", 0xFFFF7A2F.toInt(), V3(-.07f, hh, .16f), Z, Y) { a, b -> sq(a, b) && !(abs(a) < e * .3f && abs(b) < e * .3f) },
     )
 
     private fun render(eye: V3, target: V3, rnd: Random): FrameSample {
@@ -86,7 +86,7 @@ class SyntheticScanTest {
             if (dist > .015f) misses += "${tl.name}: centro errado por %.1f cm".format(dist * 100)
             if (ang > 8) misses += "${tl.name}: normal errada por %.0f°".format(ang)
             if (cand.shape != tl.shape) misses += "${tl.name}: forma ${cand.shape} (esperado ${tl.shape})"
-            if (cand.size != "medio") misses += "${tl.name}: tamanho ${cand.size}"
+            if (cand.size != "grande") misses += "${tl.name}: tamanho ${cand.size}"
         }
         println(report)
         assertTrue("$misses\n$report", misses.isEmpty())
