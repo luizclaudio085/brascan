@@ -31,6 +31,13 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Codec B5 (ida e volta com códigos reais do simulador)
+        run: node tools/testar_b5.cjs
+
       - name: Chave de assinatura
         env:
           KEYSTORE_B64: ${{ secrets.BRASCAN_KEYSTORE_B64 }}

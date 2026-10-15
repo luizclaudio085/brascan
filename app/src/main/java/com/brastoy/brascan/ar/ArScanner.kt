@@ -16,6 +16,7 @@ import com.brastoy.brascan.three.Scene
 import com.brastoy.brascan.three.TileMesh
 import com.brastoy.brascan.three.V3
 import com.brastoy.brascan.vision.Catalog
+import com.brastoy.brascan.vision.Collision
 import com.brastoy.brascan.vision.FrameProcessor
 import com.brastoy.brascan.vision.FrameSample
 import com.brastoy.brascan.vision.FusionMap
@@ -140,7 +141,12 @@ class ArScanView(ctx: Context, private val session: Session, private val onStatu
                     coverage(sample.camToWorld)
                     if (System.currentTimeMillis() - lastExtract > 1000) {
                         lastExtract = System.currentTimeMillis()
-                        pieces = map.extract()
+                        // sem interpenetração também na câmera; quem tem mais pontos observados fica onde foi visto
+                        pieces = map.extract().let { found ->
+                            val bodies = found.mapIndexed { i, p -> Collision.Body(i, p.shape, p.center, p.u, p.v, Catalog.edgeM(p.size), weight = p.support.toFloat()) }
+                            Collision.resolve(bodies, iters = 30, tol = .0005f, floor = false)
+                            found.mapIndexed { i, p -> p.copy(center = bodies[i].center) }
+                        }
                         cloud = map.cloud(2).let { c -> if (c.size > 6000) c.filterIndexed { i, _ -> i % (c.size / 6000 + 1) == 0 } else c }
                     }
                     hint = when {

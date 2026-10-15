@@ -92,7 +92,7 @@ object Layout {
                     val x = (p.cx - cx) * imgAspect * k
                     when (view) {
                         Vista.FRENTE -> V3(x, (floor - p.cy) * k + p.lift * edge, p.depth * edge)
-                        Vista.CIMA -> V3(x, (if (orient == Orient.DEITADA) Catalog.THICKNESS / 2 * edge else edge / 2) + p.lift * edge, (p.cy - cy) * k + p.depth * edge)
+                        Vista.CIMA -> V3(x, (if (orient == Orient.DEITADA) Catalog.thickness(p.size, edge) / 2 else edge / 2) + p.lift * edge, (p.cy - cy) * k + p.depth * edge)
                     }
                 }
                 Placed(p, c, u, v, edge)
@@ -126,9 +126,35 @@ object Layout {
      * só ela se mexe — é a que o usuário está empurrando.
      */
     fun solve(placed: List<Placed>, selected: Int): List<Placed> {
-        val bodies = placed.map { Collision.Body(it.piece.id, it.piece.shape, it.center, it.u, it.v, it.edge, fixed = selected >= 0 && it.piece.id != selected) }
+        val bodies = placed.map { Collision.Body(it.piece.id, it.piece.shape, it.center, it.u, it.v, it.edge, fixed = selected >= 0 && it.piece.id != selected, size = it.piece.size) }
         Collision.resolve(bodies, iters = 80)
         return placed.mapIndexed { i, pl -> pl.copy(center = bodies[i].center) }
+    }
+
+    /**
+     * Pronto para o simulador, que recusa qualquer sobreposição > 0,00001 ou ponto abaixo do chão:
+     * encaixe vai em cima da moldura (empilhado), todas as peças ganham folga maior que a quantização
+     * do código (1/256) e nada fica abaixo de y = 0.
+     */
+    fun exportReady(placed: List<Placed>): List<Placed> {
+        val list = placed.toMutableList()
+        for ((i, pl) in list.withIndex()) {
+            if (pl.piece.shape != "encaixe") continue
+            val frame = list.firstOrNull { f -> Catalog.holes(f.piece.shape).isNotEmpty() && kotlin.math.abs(f.n.dot(pl.n)) > .9f && (pl.center - f.center).len() < f.edge * .3f } ?: continue
+            val up = if (frame.n.y >= 0) frame.n else frame.n * -1f
+            list[i] = pl.copy(center = frame.center + up * (Catalog.thickness(frame.piece.size, frame.edge) / 2 + Catalog.thickness(pl.piece.size, pl.edge) / 2 + .01f))
+        }
+        Collision.allowInserts = false
+        val bodies = list.map { Collision.Body(it.piece.id, it.piece.shape, it.center, it.u, it.v, it.edge, size = it.piece.size, inflate = .012f) }
+        Collision.resolve(bodies, iters = 200, tol = 0f)
+        Collision.allowInserts = true
+        val out = list.mapIndexed { i, pl -> pl.copy(center = bodies[i].center) }
+        // chão: o ponto mais baixo de cada peça fica pelo menos 2/256 acima de zero mesmo depois de arredondar
+        return out.map { pl ->
+            val t = Catalog.thickness(pl.piece.size, pl.edge)
+            val low = Catalog.polygon(pl.piece.shape).minOf { (a, b) -> minOf((pl.center + pl.u * (a * pl.edge) + pl.v * (b * pl.edge) + pl.n * (t / 2)).y, (pl.center + pl.u * (a * pl.edge) + pl.v * (b * pl.edge) - pl.n * (t / 2)).y) }
+            if (low < 2f / 256) pl.copy(center = pl.center + V3(0f, 2f / 256 - low, 0f)) else pl
+        }
     }
 
     /** Quatérnio (x, y, z, w) da base (u, v, n) — mesma convenção do MK-7: identidade = peça em pé de frente. */

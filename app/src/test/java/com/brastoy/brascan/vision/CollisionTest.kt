@@ -18,6 +18,14 @@ class CollisionTest {
         assertTrue((b.center - a.center).x > .99f)
     }
 
+    @Test fun wellObservedPieceMovesLess() {
+        val seen = Collision.Body(1, "quadrado", V3(0f, flatT, 0f), X, Z, 1f, weight = 9f)
+        val guess = Collision.Body(2, "quadrado", V3(.6f, flatT, 0f), X, Z, 1f, weight = 1f)
+        Collision.resolve(listOf(seen, guess))
+        assertTrue("peça confiável andou ${-seen.center.x}", -seen.center.x < .05f)
+        assertTrue(guess.center.x - seen.center.x > .99f)
+    }
+
     @Test fun touchingTilesDoNotMove() {
         val a = flat(1, "quadrado", 0f, 0f); val b = flat(2, "quadrado", 1f, 0f)
         assertEquals(0, Collision.resolve(listOf(a, b)))

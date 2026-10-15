@@ -15,7 +15,7 @@ object TileMesh {
 
     fun build(s: Scene, shape: String, size: String, center: V3, u: V3, v: V3, edge: Float, color: Color, tag: Int, selected: Boolean, shadow: Boolean = true) {
         val n = u.cross(v).norm()
-        val t = Catalog.THICKNESS * edge
+        val t = Catalog.thickness(size, edge)
         fun P(a: Float, b: Float, z: Float) = center + u * (a * edge) + v * (b * edge) + n * z
         val rimColor = mix(color, Color.White, .22f)
         val glow = if (selected) Color.White else mix(color, Color.White, .55f)

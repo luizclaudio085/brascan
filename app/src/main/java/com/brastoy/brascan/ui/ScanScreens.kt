@@ -94,6 +94,7 @@ import com.brastoy.brascan.three.V3
 import com.brastoy.brascan.three.GlViewport
 import com.brastoy.brascan.three.floorGrid
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import kotlin.math.hypot
@@ -271,14 +272,26 @@ fun ModelScreen(st: ScanState) {
         val sel = st.pieces.firstOrNull { it.id == st.selected }
         GlassCard(Modifier.fillMaxWidth().padding(12.dp)) {
             if (sel == null) {
+                val scope = androidx.compose.runtime.rememberCoroutineScope()
+                var b5 by remember { mutableStateOf<String?>(null) }
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    FilledTonalButton(enabled = !demo, onClick = { copy(ctx, Layout.json(st.placed())) }, modifier = Modifier.weight(1f)) {
-                        Icon(Icons.Rounded.ContentCopy, null); Spacer(Modifier.width(6.dp)); Text("Copiar JSON")
-                    }
-                    Button(enabled = !demo, onClick = {
-                        ctx.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("application/json").putExtra(Intent.EXTRA_TEXT, Layout.json(st.placed())), "Enviar para o MK-7"))
-                    }, modifier = Modifier.weight(1f)) { Icon(Icons.Rounded.Share, null); Spacer(Modifier.width(6.dp)); Text("Enviar MK-7") }
+                    Button(enabled = !demo && b5 != "…", onClick = {
+                        b5 = "…"
+                        scope.launch {
+                            when (val r = com.brastoy.brascan.scan.B5Export.encode(ctx, st.placed())) {
+                                is com.brastoy.brascan.scan.B5Export.Result.Ok -> {
+                                    (ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Brastoy", r.code))
+                                    b5 = "Copiado e conferido (reimportado sem diferença, erro máx. ${"%.1f".format(r.maxPosError * 75)} mm): ${r.pieces} peças\n${r.code}"
+                                }
+                                is com.brastoy.brascan.scan.B5Export.Result.Failed -> b5 = "Não exportei: ${r.message}"
+                            }
+                        }
+                    }, modifier = Modifier.weight(1f)) { Icon(Icons.Rounded.ContentCopy, null); Spacer(Modifier.width(6.dp)); Text("Código B4/B5") }
+                    FilledTonalButton(enabled = !demo, onClick = {
+                        ctx.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("application/json").putExtra(Intent.EXTRA_TEXT, Layout.json(Layout.exportReady(st.placed()))), "Enviar para o simulador"))
+                    }, modifier = Modifier.weight(1f)) { Icon(Icons.Rounded.Share, null); Spacer(Modifier.width(6.dp)); Text("JSON") }
                 }
+                b5?.takeIf { it != "…" }?.let { Text(it, color = if (it.startsWith("Não")) Palette.pink else Palette.y, fontSize = 12.sp, maxLines = 6, modifier = Modifier.padding(top = 8.dp)) }
                 Text("Arraste: girar · pinça: zoom · toque duplo: recentralizar", color = Palette.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
             } else PieceEditor(st, sel)
         }

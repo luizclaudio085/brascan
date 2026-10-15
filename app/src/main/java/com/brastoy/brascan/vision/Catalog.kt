@@ -17,7 +17,11 @@ object Catalog {
     /** Lado do quadrado grande (m). Padrão do simulador; sem régua nas fotos, confirmar se possível. */
     const val SIDE_M = .075f
     val SCALE = mapOf("grande" to 1f, "medio" to .81f, "pequeno" to .5f)
-    const val THICKNESS = .065f // em lados
+    /** Espessura em lados do quadrado GRANDE, igual para todos os tamanhos (como no simulador: thickness=.065). */
+    const val THICKNESS = .065f
+
+    /** Espessura na unidade em que [edge] (lado desta peça) está medido. */
+    fun thickness(size: String, edge: Float) = THICKNESS * edge / SCALE.getValue(size)
     /** Borda sem cor/escura em volta da parte colorida (m). */
     const val FRAME_M = .003f
 

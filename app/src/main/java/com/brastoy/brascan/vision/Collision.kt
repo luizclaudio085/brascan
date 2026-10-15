@@ -11,11 +11,15 @@ import kotlin.math.min
  * penetração (teorema dos eixos separadores). Encostar (ímã com ímã) é permitido.
  */
 object Collision {
-    class Body(val id: Int, val shape: String, var center: V3, val u: V3, val v: V3, val edge: Float, val fixed: Boolean = false) {
+    /** [weight]: confiança da posição (ex.: pontos observados). Na colisão, quem tem mais evidência se move menos. */
+    /** [inflate]: folga extra (fração do lado) — na exportação garante distância maior que a quantização do formato. */
+    class Body(val id: Int, val shape: String, var center: V3, val u: V3, val v: V3, val edge: Float, val fixed: Boolean = false, val weight: Float = 1f,
+               val size: String = "grande", val inflate: Float = 0f) {
         val n = u.cross(v).norm()
-        val t = Catalog.THICKNESS * edge
+        val t = Catalog.thickness(size, edge) + inflate * edge * 2
+        private val g = edge * (1 + inflate)
         /** Vértices de cada parte convexa, relativos ao centro. */
-        val parts: List<List<V3>> = Catalog.convexParts(shape).map { part -> part.flatMap { (a, b) -> listOf(u * (a * edge) + v * (b * edge) + n * (t / 2), u * (a * edge) + v * (b * edge) - n * (t / 2)) } }
+        val parts: List<List<V3>> = Catalog.convexParts(shape).map { part -> part.flatMap { (a, b) -> listOf(u * (a * g) + v * (b * g) + n * (t / 2), u * (a * g) + v * (b * g) - n * (t / 2)) } }
         val partEdges: List<List<V3>> = Catalog.convexParts(shape).map { part -> part.indices.map { i -> val (a, b) = part[i]; val (c, d) = part[(i + 1) % part.size]; (u * (c - a) + v * (d - b)).norm() } }
         val radius = parts.flatten().maxOf { it.len() }
         val minY get() = parts.flatten().minOf { it.y } + center.y
@@ -79,7 +83,10 @@ object Collision {
     }
 
     /** Encaixe dentro do vão de uma moldura/janela/porta: é o uso normal, não é colisão. */
+    var allowInserts = true
+
     private fun allowed(a: Body, b: Body): Boolean {
+        if (!allowInserts) return false
         val (ins, frame) = when { a.shape == "encaixe" -> a to b; b.shape == "encaixe" -> b to a; else -> return false }
         if (Catalog.holes(frame.shape).isEmpty() || abs(ins.n.dot(frame.n)) < .9f) return false
         val d = ins.center - frame.center
@@ -109,7 +116,7 @@ object Collision {
                 when {
                     a.fixed -> b.center = b.center + full
                     b.fixed -> a.center = a.center - full
-                    else -> { a.center = a.center - full * .5f; b.center = b.center + full * .5f }
+                    else -> { val ka = b.weight / (a.weight + b.weight); a.center = a.center - full * ka; b.center = b.center + full * (1f - ka) }
                 }
                 any = true; moves++
             }
