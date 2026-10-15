@@ -86,6 +86,16 @@ fun Viewport3D(
 /** Piso quadriculado que some com a distância (névoa), usado em todas as cenas. */
 fun Scene.floorGrid(half: Int = 5, step: Float = 1f, color: Color = Color(0xFF55AAFF)) {
     val e = half * step
+    // tapete claro que some nas bordas: dá onde a sombra aparecer
+    val mat = Color(0xFF2B3A52); val seg = 48
+    fun ring(r: Float, i: Int) = V3(r * kotlin.math.cos(i * 2 * Math.PI / seg).toFloat(), 0f, r * kotlin.math.sin(i * 2 * Math.PI / seg).toFloat())
+    val rings = listOf(0f to .95f, e * .45f to .85f, e * .8f to .35f, e * 1.05f to 0f)
+    for (i in 0 until seg) for (k in 0 until rings.size - 1) {
+        val (r0, a0) = rings[k]; val (r1, a1) = rings[k + 1]
+        val p00 = ring(r0, i) to mat.copy(alpha = a0); val p01 = ring(r0, i + 1) to mat.copy(alpha = a0)
+        val p10 = ring(r1, i) to mat.copy(alpha = a1); val p11 = ring(r1, i + 1) to mat.copy(alpha = a1)
+        ground += p00; ground += p10; ground += p11; ground += p00; ground += p11; ground += p01
+    }
     for (i in -half..half) for (j in -half until half) {
         val k = i * step; val a = j * step; val b = a + step
         val fade = (1f - kotlin.math.max(kotlin.math.abs(k), kotlin.math.abs(a + step / 2)) / e).coerceIn(0f, 1f)
@@ -95,5 +105,8 @@ fun Scene.floorGrid(half: Int = 5, step: Float = 1f, color: Color = Color(0xFF55
     }
 }
 
-/** Sombra simples: projeta o polígono no piso (y=0) a partir de uma luz alta. */
-fun Scene.shadowOf(pts: List<V3>) { shadows += pts.map { V3(it.x - it.y * .35f, 0.002f, it.z - it.y * .25f) } }
+/** Sombra: projeta o polígono no piso (y=0) na direção da luz principal do renderizador (vem de -X, +Z, do alto). */
+fun Scene.shadowOf(pts: List<V3>) { shadows += pts.map { V3(it.x + it.y * SHADOW_DX, 0.002f, it.z + it.y * SHADOW_DZ) } }
+/** Luz principal (-.45, .85, .35): a sombra anda +X e -Z, proporcional à altura. */
+const val SHADOW_DX = .45f / .85f
+const val SHADOW_DZ = -.35f / .85f

@@ -23,6 +23,7 @@ class GlSceneRenderer {
         val opaque: FloatArray,
         val clear: List<Pair<V3, FloatArray>>,
         val shadows: FloatArray,
+        val ground: FloatArray,
         val under: FloatArray, val underWidth: Float,
         val lines: FloatArray, val lineWidth: Float,
     )
@@ -95,6 +96,8 @@ class GlSceneRenderer {
             val ox = (cos(a) * r).toFloat(); val oz = (sin(a) * r).toFloat()
             for (p in t) { sh[q++] = p.x + ox; sh[q++] = p.y; sh[q++] = p.z + oz; sh[q++] = 0f; sh[q++] = 0f; sh[q++] = 0f; sh[q++] = scene.shadowAlpha / k * 1.6f }
         }
+        val gr = FloatArray(scene.ground.size * 7); var g = 0
+        for ((pt, c) in scene.ground) { gr[g++] = pt.x; gr[g++] = 0f; gr[g++] = pt.z; gr[g++] = c.red; gr[g++] = c.green; gr[g++] = c.blue; gr[g++] = c.alpha }
         fun lineData(ls: List<Line3>): FloatArray {
             val d = FloatArray(ls.size * 14); var j = 0
             for (l in ls) for (p in listOf(l.a, l.b)) { d[j++] = p.x; d[j++] = p.y; d[j++] = p.z; d[j++] = l.color.red; d[j++] = l.color.green; d[j++] = l.color.blue; d[j++] = l.color.alpha }
@@ -105,7 +108,7 @@ class GlSceneRenderer {
         val all = outline + scene.lines
         val op = FloatArray(opaque.sumOf { it.size }); var o = 0
         for (d in opaque) { System.arraycopy(d, 0, op, o, d.size); o += d.size }
-        return Prepared(op, clear, sh, lineData(scene.under), scene.under.maxOfOrNull { it.width } ?: 1f, lineData(all), all.maxOfOrNull { it.width } ?: 1f)
+        return Prepared(op, clear, sh, gr, lineData(scene.under), scene.under.maxOfOrNull { it.width } ?: 1f, lineData(all), all.maxOfOrNull { it.width } ?: 1f)
     }
 
     fun draw(scene: Scene, view: FloatArray, proj: FloatArray, eye: V3, points: List<Pair<V3, Int>> = emptyList(), pointSize: Float = 6f) {
@@ -118,6 +121,7 @@ class GlSceneRenderer {
 
         // chão e sombras sem escrever profundidade
         GLES20.glDepthMask(false)
+        if (p.ground.isNotEmpty()) flatDraw(p.ground, GLES20.GL_TRIANGLES, 1f)
         if (p.under.isNotEmpty()) { GLES20.glLineWidth(p.underWidth); flatDraw(p.under, GLES20.GL_LINES, 1f) }
         if (p.shadows.isNotEmpty()) flatDraw(p.shadows, GLES20.GL_TRIANGLES, 1f)
         GLES20.glDepthMask(true)
