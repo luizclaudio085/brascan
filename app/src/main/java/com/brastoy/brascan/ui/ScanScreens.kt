@@ -91,7 +91,7 @@ import com.brastoy.brascan.scan.SIZES
 import com.brastoy.brascan.scan.Vista
 import com.brastoy.brascan.three.Camera
 import com.brastoy.brascan.three.V3
-import com.brastoy.brascan.three.Viewport3D
+import com.brastoy.brascan.three.GlViewport
 import com.brastoy.brascan.three.floorGrid
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -110,12 +110,17 @@ class ScanState {
     fun newId() = nextId++
     fun aspect() = image?.let { it.width.toFloat() / it.height } ?: 1f
     fun placed(): List<Placed> = Layout.place(pieces, vista, aspect())
+    /** Substitui as peças pelas reconstruídas no scanner 3D (pose real, sem foto). */
+    fun importScan(found: List<com.brastoy.brascan.vision.Piece3D>) {
+        image = null; selected = -1; pieces.clear()
+        val list = Layout.fromScan(found, nextId); nextId += list.size; pieces.addAll(list)
+    }
     fun update(id: Int, f: (Piece) -> Piece) { val i = pieces.indexOfFirst { it.id == id }; if (i >= 0) pieces[i] = f(pieces[i]) }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ScanScreen(st: ScanState, open3D: () -> Unit) {
+fun ScanScreen(st: ScanState, openAr: () -> Unit, open3D: () -> Unit) {
     val ctx = LocalContext.current
     var photoUri by remember { mutableStateOf<Uri?>(null) }
     var pendingLoad by remember { mutableStateOf<Uri?>(null) }
@@ -139,7 +144,15 @@ fun ScanScreen(st: ScanState, open3D: () -> Unit) {
 
     Column(Modifier.verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         GlassCard(Modifier.fillMaxWidth()) {
-            Label("1 · Como a foto foi tirada")
+            Label("Scanner 3D (SLAM)")
+            Text("Ande em volta da construção com a câmera: o celular rastreia a própria posição, mede a profundidade e monta as peças em 3D com a orientação real.",
+                color = Color(0xFFC9D6EA), fontSize = 14.sp, modifier = Modifier.padding(top = 6.dp))
+            Button(onClick = openAr, modifier = Modifier.fillMaxWidth().padding(top = 12.dp).height(56.dp), shape = RoundedCornerShape(18.dp)) {
+                Icon(Icons.Rounded.ViewInAr, null); Spacer(Modifier.width(10.dp)); Text("Escanear em 3D", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            }
+        }
+        GlassCard(Modifier.fillMaxWidth()) {
+            Label("Ou por foto · 1 · Como a foto foi tirada")
             Spacer(Modifier.height(8.dp))
             SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
                 Vista.entries.forEachIndexed { i, v ->
@@ -235,7 +248,7 @@ fun ModelScreen(st: ScanState) {
     }
     Column(Modifier.fillMaxSize()) {
         Box(Modifier.fillMaxWidth().weight(1f)) {
-            Viewport3D(Modifier.fillMaxSize(), camera, autoRotate = st.selected < 0, onTap = { if (!demo) st.selected = it }) { s ->
+            GlViewport(Modifier.fillMaxSize(), camera, autoRotate = st.selected < 0, onTap = { if (!demo) st.selected = it }) { s ->
                 s.floorGrid(6, .8f)
                 val placed = if (demo) demoModel() else st.placed()
                 Layout.draw(s, placed, st.selected)
@@ -305,7 +318,7 @@ private fun demoModel(): List<Placed> {
     val c = Palette.tiles
     var id = 10_000
     fun p(shape: String, color: Int, at: V3, o: Orient, turn: Int = 0) =
-        Placed(Piece(id++, 0f, 0f, 0f, 0f, shape, color = color, orient = o, turn = turn), at, o, e)
+        Layout.fixed(Piece(id++, shape = shape, color = color, orient = o, turn = turn), at, o)
     return listOf(
         p("quadrado", c[0], V3(-h, h, e), Orient.FRENTE), p("janela", c[1], V3(h, h, e), Orient.FRENTE),
         p("quadrado", c[1], V3(-h, h, -e), Orient.FRENTE), p("quadrado", c[0], V3(h, h, -e), Orient.FRENTE),

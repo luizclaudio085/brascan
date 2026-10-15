@@ -3,10 +3,13 @@
 App Android (Kotlin + Jetpack Compose) para os ímãs Brastoy:
 
 - **Campo**: magnetômetro em tempo real com o vetor B em **3D** (gira/zoom), rastro, eixos e detector de ímã ("Zerar ambiente").
-- **Scanner**: foto de frente ou de cima → segmentação por cor encontra as peças sozinha (forma, tamanho, cor). Toque para corrigir.
-- **3D**: modelo montado com as peças, girável; toque numa peça para trocar forma, tamanho, cor, orientação, profundidade e altura. Exporta JSON para o simulador MK-7.
+- **Scanner 3D (SLAM)**: ARCore rastreia a pose do celular; a cada ~0,3 s o app segmenta a imagem por cor, desprojeta os pixels de cada peça com a profundidade (ou cruza com a nuvem de pontos do SLAM), funde tudo num mapa de voxels e, por geometria (RANSAC de planos, PCA, casco convexo, retângulo mínimo, furos/entalhes), reconstrói cada peça com forma, tamanho, cor, posição e orientação reais. A reconstrução aparece ao vivo por cima da câmera.
+- **Scanner por foto**: foto de frente ou de cima → mesma segmentação e classificação geométrica. Toque para corrigir.
+- **3D**: renderizador OpenGL (z-buffer, antisserrilhado, sombras); toque numa peça para trocar forma, tamanho, cor, orientação, profundidade e altura. Exporta JSON para o simulador MK-7 (`unitMeters` dá a escala).
 
-Uma foto só mostra um lado, então a profundidade é estimada — ajuste no editor 3D.
+Medidas das peças ficam em `vision/Catalog.kt` (ainda estimadas: 5 / 7,5 / 10 cm). Sem sensor de profundidade o scanner 3D acha as peças, mas a forma fica menos precisa.
+
+`app/src/test` tem um "scanner virtual" que renderiza uma construção conhecida de vários ângulos e confere a reconstrução; roda no CI antes de cada release.
 
 ## Atualização automática
 

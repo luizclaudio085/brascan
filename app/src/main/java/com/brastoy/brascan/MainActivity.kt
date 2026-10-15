@@ -95,6 +95,7 @@ private fun App() {
     val scan = remember { ScanState() }
     val (field, hasSensor) = rememberField()
     val update by Updater.state.collectAsState()
+    var arOpen by rememberSaveable { mutableStateOf(false) }
 
     // Checa o GitHub a cada 30 s enquanto o app está aberto: push na main → APK novo no celular em poucos minutos.
     val lifecycle = LocalLifecycleOwner.current.lifecycle
@@ -102,6 +103,12 @@ private fun App() {
         lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
             while (true) { Updater.tick(ctx); delay(30_000) }
         }
+    }
+
+    if (arOpen) {
+        androidx.activity.compose.BackHandler { arOpen = false }
+        com.brastoy.brascan.ar.ArScanScreen(onClose = { arOpen = false }, onDone = { found -> scan.importScan(found); arOpen = false; tab = Tab.MODELO })
+        return
     }
 
     Scaffold(
@@ -121,7 +128,7 @@ private fun App() {
             Box(Modifier.weight(1f)) {
                 when (tab) {
                     Tab.CAMPO -> FieldScreen(field, hasSensor)
-                    Tab.SCAN -> ScanScreen(scan) { tab = Tab.MODELO }
+                    Tab.SCAN -> ScanScreen(scan, openAr = { arOpen = true }) { tab = Tab.MODELO }
                     Tab.MODELO -> ModelScreen(scan)
                     Tab.AJUSTES -> Settings(update)
                 }

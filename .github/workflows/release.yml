@@ -46,7 +46,7 @@ jobs:
           BRASCAN_KEY_PASSWORD: ${{ secrets.BRASCAN_STORE_PASSWORD }}
         run: |
           chmod +x gradlew
-          ./gradlew --no-daemon assembleRelease
+          ./gradlew --no-daemon testDebugUnitTest assembleRelease
           cp app/build/outputs/apk/release/app-release.apk brascan.apk
 
       - name: Publicar release
