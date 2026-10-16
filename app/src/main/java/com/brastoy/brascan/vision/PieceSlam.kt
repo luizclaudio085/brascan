@@ -117,6 +117,9 @@ class PieceSlam(private val k: Intrinsics, private val autoOptimize: Boolean = t
     var camera: Pose? = null; private set
     var lost = false; private set
     private var lostFrames = 0
+    /** Quadros seguidos sem conseguir associar: só vira "perdi a posição" depois de [LOST_AFTER] (um quadro ruim é normal). */
+    private var badStreak = 0
+    private fun badFrame() { badStreak++; lastMatched = 0; if (badStreak >= LOST_AFTER && camera != null) lost = true }
     var frames = 0; private set
     var lastMatched = 0; private set
     /** Quadro-chave: pose da câmera, gravidade e cantos medidos de cada peça (para o ajuste global). */
@@ -144,7 +147,7 @@ class PieceSlam(private val k: Intrinsics, private val autoOptimize: Boolean = t
     fun detect(seg: Segmentation, px: IntArray? = null): List<Detection> {
         val out = ArrayList<Detection>()
         for (b in seg.blobs) {
-            val d = detectBlob(b)
+            val d = detectBlob(b, seg)
             if (d != null) { out += d; continue }
             // região grande que não fecha com molde nenhum: duas peças da mesma cor juntas? tenta dividir na
             // fileira escura (ímãs/emenda) e reconhecer as partes
@@ -152,12 +155,12 @@ class PieceSlam(private val k: Intrinsics, private val autoOptimize: Boolean = t
             // só regiões que parecem duas peças (alongadas ou côncavas), sem furo de verdade; cada parte tem que ser grande
             val aspect = fit?.let { it.obb.w / max(it.obb.h, 1e-3f) }?.let { if (it < 1f) 1f / it else it } ?: 1f
             if (weakSplitting && px != null && fit != null && b.count >= 600 && fit.shape in usable && fit.gaps.none { it.enclosed } && (aspect >= 1.35f || fit.solidity < .85f))
-                for (part in Segmenter.weakSplit(b, seg, px)) if (part.count >= b.count * .35f) detectBlob(part)?.let { out += it }
+                for (part in Segmenter.weakSplit(b, seg, px)) if (part.count >= b.count * .35f) detectBlob(part, seg)?.let { out += it }
         }
         return out
     }
 
-    private fun detectBlob(b: Blob): Detection? {
+    private fun detectBlob(b: Blob, seg: Segmentation): Detection? {
         run {
             val fit = b.fit ?: return null
             if (fit.shape !in usable || b.count < 120) return null
@@ -194,12 +197,44 @@ class PieceSlam(private val k: Intrinsics, private val autoOptimize: Boolean = t
             val shape = if (outlineShape == "quadrado") rectifiedShape(b, top.pose) ?: fit.shape.takeIf { it in SQUARE_FAMILY } ?: "quadrado" else outlineShape
             val ray = norm(top.pose.t); val nrm = top.pose.col(2)
             val frontal = abs(ray[0] * nrm[0] + ray[1] * nrm[1] + ray[2] * nrm[2])
+            // peça de verdade tem ranhuras escuras dos ímãs perto das bordas: caixa, chão, mão, parede não têm
+            if (magnetCheck && !magnetsVisible(top.pose, shape, seg)) return null
             val byOutline = perModel.mapValues { (_, ss) -> val mn = ss.minOfOrNull { it.rms } ?: 0.0; ss.filter { it.rms <= mn * 1.6 + .6 }.map { it.pose } }
             return Detection(shape, b.color, b.hueBin, cands, top.rms, b.count, img, frontal, want, byOutline, ambiguous)
         }
     }
 
     private val SQUARE_FAMILY = setOf("quadrado", "moldura", "janela", "porta", "encaixe")
+
+    /**
+     * Confere os ímãs: projeta cada sítio de ímã do catálogo na imagem e compara a luminância ali com a do painel
+     * logo para dentro. Peça real: ≥ 40% dos sítios visíveis bem mais escuros. Peça pequena demais na imagem
+     * (< 30 px de lado) não dá para conferir e passa.
+     */
+    private fun magnetsVisible(pose: Pose, shape: String, seg: Segmentation): Boolean {
+        val L = seg.L ?: return true
+        val sites = Catalog.magnets(shape, "grande"); if (sites.isEmpty()) return true
+        val e = Catalog.edgeM("grande").toDouble()
+        val c0 = PlanarPose.project(pose, doubleArrayOf(-.5 * e, -.5 * e), k); val c1 = PlanarPose.project(pose, doubleArrayOf(.5 * e, -.5 * e), k)
+        if (sqrt((c1[0] - c0[0]) * (c1[0] - c0[0]) + (c1[1] - c0[1]) * (c1[1] - c0[1])) < 30) return true
+        // ranhura: mínimo numa janela 5×5 (a barra tem 2-3 px e a projeção erra 1-2 px); painel: média 3×3
+        fun at(u: Double, v: Double, minimum: Boolean): Float? {
+            val x = u.toInt(); val y = v.toInt(); val r = if (minimum) 2 else 1
+            if (x < r || y < r || x >= seg.w - r || y >= seg.h - r) return null
+            var acc = if (minimum) Float.MAX_VALUE else 0f; var n = 0
+            for (dy in -r..r) for (dx in -r..r) { val l = L[(y + dy) * seg.w + x + dx]; acc = if (minimum) minOf(acc, l) else acc + l; n++ }
+            return if (minimum) acc else acc / n
+        }
+        var seen = 0; var dark = 0
+        for (m in sites) {
+            val site = PlanarPose.project(pose, doubleArrayOf(m.x * e, m.y * e), k)
+            val inner = PlanarPose.project(pose, doubleArrayOf(m.x * e * .55, m.y * e * .55), k)
+            val ls = at(site[0], site[1], true) ?: continue; val li = at(inner[0], inner[1], false) ?: continue
+            seen++; if (ls < li - max(6f, li * .12f)) dark++
+        }
+        if (seen < 3) return true
+        return dark * 4 >= seen // ≥ 25% dos sítios (oclusão, borrão e perspectiva escondem o resto)
+    }
 
     private fun solveAll(model: List<DoubleArray>, img: List<DoubleArray>): List<PlanarPose.Result> {
         val sols = ArrayList<PlanarPose.Result>()
@@ -242,7 +277,7 @@ class PieceSlam(private val k: Intrinsics, private val autoOptimize: Boolean = t
     fun track(seg: Segmentation, upCam: DoubleArray? = null, px: IntArray? = null): List<Detection> {
         frames++
         val dets = detect(seg, px)
-        if (dets.isEmpty()) { lost = camera != null; lastMatched = 0; return dets }
+        if (dets.isEmpty()) { badFrame(); return dets }
         val cam0 = camera
         if (map.isEmpty()) {
             // só semeia com peça nítida e razoavelmente de frente: uma peça cortada/de perfil no 1º quadro envenenava a sessão
@@ -287,8 +322,10 @@ class PieceSlam(private val k: Intrinsics, private val autoOptimize: Boolean = t
         }
         // uma peça só (sem confirmação) apenas se for continuação suave do quadro anterior
         val needed = if (relocating && map.size > 1) 2 else 1
-        if (matches.size < needed || (matches.size == 1 && cam0 != null && (lost || dist(matches[0].camEst.t, cam0.t) > .12))) { lost = true; lastMatched = 0; return dets }
+        // uma peça só basta quando o mapa é pequeno ou a câmera não andou longe; "perdido" de verdade exige 2
+        if (matches.size < needed || (matches.size == 1 && cam0 != null && ((lost && map.size > 2) || dist(matches[0].camEst.t, cam0.t) > .12))) { badFrame(); return dets }
         if (relocating) relocalized = true
+        badStreak = 0
         val takenDet = matches.map { it.det }.toHashSet()
 
         // pose da câmera: média robusta das estimativas de cada peça (descarta as que discordam da mediana)
@@ -301,7 +338,7 @@ class PieceSlam(private val k: Intrinsics, private val autoOptimize: Boolean = t
         for ((i, m) in inl.withIndex()) { val q = Rot.toQuat(m.camEst.r); val sg = if (q.indices.sumOf { q[it] * ref[it] } < 0) -1.0 else 1.0; for (j in 0 until 4) acc[j] += q[j] * sg * wts[i] }
         var cam = Pose(Rot.fromQuat(acc), t)
         if (upCam != null) cam = gravityCorrect(cam, upCam)
-        camera = cam; lost = false; lastMatched = inl.size
+        camera = cam; lost = false; badStreak = 0; lastMatched = inl.size
 
         val inlSet = inl.toSet()
         for (m in matches) if (m in inlSet) {
@@ -649,6 +686,9 @@ class PieceSlam(private val k: Intrinsics, private val autoOptimize: Boolean = t
     companion object {
         /** Pontos de vista distintos (≥ 1 cm entre si) para uma peça entrar no modelo: 3 deixava passar cópias por deriva. */
         const val MIN_VIEWS = 3
+        /** Quadros ruins seguidos antes de declarar a posição perdida. */
+        const val LOST_AFTER = 5
+        @JvmField var magnetCheck = true
         @JvmField var weakSplitting = true
         @JvmField var ambiguousVote = true
         /** Empate quadrado/retângulo decidido pela proporção 2D (como antes); o voto baixo das vistas de viés e o filtro por molde no update() já tratam a parede vista de lado. */

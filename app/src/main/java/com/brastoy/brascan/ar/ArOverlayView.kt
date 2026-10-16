@@ -27,6 +27,8 @@ class ArOverlayView(ctx: Context, onTopOfWindow: Boolean) : GLSurfaceView(ctx), 
     private var w = 1; private var h = 1
     private var scene = Scene()
     private var sceneKey: Any? = null
+    private var liveScene = Scene()
+    private var liveSceneKey: Any? = null
     private var lastBuild = 0L
     private val view = FloatArray(16); private val proj = FloatArray(16)
 
@@ -47,6 +49,15 @@ class ArOverlayView(ctx: Context, onTopOfWindow: Boolean) : GLSurfaceView(ctx), 
         GLES20.glClearColor(0f, 0f, 0f, 0f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
         val f = frame ?: return
+        // hologramas ao vivo: pose da própria detecção, câmera = identidade (não depende do mapa)
+        OverlayMath.projection(f.k, f.w, f.h, f.rot, w, h, proj)
+        if (f.live.isNotEmpty()) {
+            val liveKey = f.live.map { p -> listOf(p.shape, p.color, q(p.center, 500f), q(p.u, 50f)) }
+            if (liveKey != liveSceneKey) { liveScene = Scene().also { s -> for (p in f.live) TileMesh.build(s, p.shape, p.size, p.center, p.u, p.v, Catalog.edgeM(p.size), Color(p.color), -1, false, shadow = false, ghost = .7f) }; liveSceneKey = liveKey }
+            android.opengl.Matrix.setIdentityM(view, 0)
+            gl.clipY = 9000f; gl.clipX = 9000f
+            gl.draw(liveScene, view, proj, V3(0f, 0f, 0f))
+        }
         val cam = f.cam ?: return
         // a cena só é refeita quando alguma peça muda de lugar (> 5 mm / ~3°) ou de estado, no máximo ~6×/s
         val key = f.pieces.map { (p, n) -> listOf(p.shape, p.size, p.color, n >= PieceSlam.MIN_VIEWS, q(p.center, 200f), q(p.u, 20f), q(p.v, 20f)) } + f.lost
@@ -56,7 +67,6 @@ class ArOverlayView(ctx: Context, onTopOfWindow: Boolean) : GLSurfaceView(ctx), 
             sceneKey = key; lastBuild = now
         }
         OverlayMath.viewMatrix(cam, view)
-        OverlayMath.projection(f.k, f.w, f.h, f.rot, w, h, proj)
         gl.clipY = 9000f; gl.clipX = 9000f
         gl.draw(scene, view, proj, V3(cam.t[0].toFloat(), cam.t[1].toFloat(), cam.t[2].toFloat()))
     }

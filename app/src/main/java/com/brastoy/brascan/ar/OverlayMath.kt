@@ -14,6 +14,8 @@ import kotlin.math.max
 class OverlayFrame(
     val cam: Pose?, val lost: Boolean, val k: Intrinsics, val w: Int, val h: Int, val rot: Int,
     val pieces: List<Pair<Piece3D, Int>>,
+    /** Peças reconhecidas neste quadro, em coordenadas da CÂMERA (x direita, y baixo, z frente): hologramas ao vivo. */
+    val live: List<Piece3D> = emptyList(),
 )
 
 /** Matrizes da realidade aumentada (sem Android, para dar para testar no PC). */

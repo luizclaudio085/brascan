@@ -95,6 +95,7 @@ data class MarkerStatus(
     /** Gravação de diagnóstico em andamento e quantos quadros já foram guardados. */
     val recording: Boolean = false,
     val recorded: Int = 0,
+    val torch: Boolean = false,
 )
 
 /**
@@ -145,6 +146,9 @@ fun MarkerScanScreen(initialMap: String? = null, onClose: () -> Unit, onDone: (L
         Column(Modifier.fillMaxWidth().statusBarsPadding().padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 FilledTonalIconButton(onClick = onClose) { Icon(Icons.Rounded.Close, "Fechar") }
+                Spacer(Modifier.width(6.dp))
+                // lanterna: peça translúcida em ambiente escuro some para o segmentador
+                FilledTonalIconButton(onClick = { engine.torch(!status.torch) }) { Text(if (status.torch) "🔦" else "🔅", fontSize = 18.sp) }
                 Spacer(Modifier.width(10.dp))
                 Column(Modifier.clip(RoundedCornerShape(16.dp)).background(Color(0xCC0A111E)).padding(horizontal = 14.dp, vertical = 10.dp).weight(1f)) {
                     Text(if (!permission) "Permita o uso da câmera" else status.advice.firstOrNull() ?: status.hint, color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
@@ -184,6 +188,9 @@ private class Engine(private val ctx: Context, private var initialMap: String?, 
     private var intr: Intrinsics? = null
     private var sensorOrientation = 90
     private var provider: ProcessCameraProvider? = null
+    @Volatile private var camera: androidx.camera.core.Camera? = null
+    @Volatile private var torchOn = false
+    fun torch(on: Boolean) { torchOn = on; camera?.cameraControl?.enableTorch(on) }
     private var lastT = 0L; private var fps = 0f
     /** Sobreposição 3D (RA) alimentada a cada quadro analisado. */
     @Volatile var overlay: ArOverlayView? = null
@@ -250,6 +257,7 @@ private class Engine(private val ctx: Context, private var initialMap: String?, 
             }
             p.unbindAll()
             val cam = p.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
+            camera = cam
             // PreviewView só cria o filho (SurfaceView ou TextureView) ao receber a superfície: espera ele aparecer
             fun kind(): Boolean? = (0 until pv.childCount).map { pv.getChildAt(it) }.firstNotNullOfOrNull { v -> if (v is android.view.SurfaceView) true else if (v is android.view.TextureView) false else null }
             var tries = 0
@@ -310,7 +318,10 @@ private class Engine(private val ctx: Context, private var initialMap: String?, 
         val dets = s.track(seg, up, rgb)
         val now = SystemClock.elapsedRealtime()
         val rot0 = img.imageInfo.rotationDegrees; lastRot = rot0
-        overlay?.frame = OverlayFrame(s.camera, s.lost, k, w, h, rot0, s.map.map { it.toPiece3D() to it.count })
+        // RA: peças confirmadas do mapa (no mundo) + o que foi reconhecido NESTE quadro, na pose da própria detecção
+        // (cola na peça de verdade mesmo quando o mapa está ruim)
+        overlay?.frame = OverlayFrame(s.camera, s.lost, k, w, h, rot0, s.map.filter { it.count >= PieceSlam.MIN_VIEWS }.map { it.toPiece3D() to it.count },
+            dets.map { d -> val p = d.candidates[0]; Piece3D(d.shape, "grande", d.color, PieceSlam.v3(p.t), PieceSlam.v3(p.col(0)), PieceSlam.v3(p.col(1)), PieceSlam.v3(p.col(2)), 0f, 0f, 1) })
         diag?.let { d -> runCatching { d.frame(rgb, w, h, rot0, k, up, s, dets, now - t0) } }
         if (lastT != 0L) fps = fps * .8f + 200f / (now - lastT).coerceAtLeast(1)
         lastT = now
@@ -333,6 +344,6 @@ private class Engine(private val ctx: Context, private var initialMap: String?, 
         publish(MarkerStatus(hint, !s.lost, s.map.size, pieces, dets.map { d -> d.imgCorners.map { upright(it[0], it[1]) } to d.color }, uw, uh, fps, up != null,
             target, adv.map { it.text }, s.restoredMap && !s.relocalized,
             s.baReports.count { it.accepted }, s.baReports.lastOrNull { it.accepted }?.rmsAfter ?: Double.NaN,
-            diag != null, diag?.frames ?: 0))
+            diag != null, diag?.frames ?: 0, torchOn))
     }
 }
