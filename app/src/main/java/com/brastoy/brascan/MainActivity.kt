@@ -176,7 +176,7 @@ private fun Header(update: Updater.State, onUpdate: () -> Unit) = Row(
 private fun UpdateBanner(s: Updater.State) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
-    val visible = s is Updater.State.Available || s is Updater.State.Downloading || s is Updater.State.NeedsPermission || s is Updater.State.Installing
+    val visible = s is Updater.State.Available || s is Updater.State.Downloading || s is Updater.State.NeedsPermission || s is Updater.State.Installing || (s is Updater.State.Failed && s.remote != null)
     AnimatedVisibility(visible) {
         GlassCard(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -187,13 +187,16 @@ private fun UpdateBanner(s: Updater.State) {
                         is Updater.State.Downloading -> "Baixando ${s.remote.name}…"
                         is Updater.State.NeedsPermission -> "Libere a instalação para atualizar"
                         is Updater.State.Installing -> "Instalando ${s.remote.name}…"
+                        is Updater.State.Failed -> "Versão ${s.remote?.name} não instalou"
                         else -> ""
                     }, color = Color.White, fontWeight = FontWeight.SemiBold)
                     if (s is Updater.State.NeedsPermission) Text("Só precisa fazer uma vez", color = Palette.muted, fontSize = 12.sp)
+                    if (s is Updater.State.Failed) Text(s.message, color = Palette.muted, fontSize = 12.sp)
                 }
                 when (s) {
                     is Updater.State.Available -> Button(onClick = { scope.launch { Updater.tick(ctx, force = true) } }) { Text("Atualizar") }
                     is Updater.State.NeedsPermission -> Button(onClick = { ctx.startActivity(Updater.permissionIntent(ctx)) }) { Text("Liberar") }
+                    is Updater.State.Failed -> Button(onClick = { scope.launch { Updater.retry(ctx) } }) { Text("Tentar de novo") }
                     else -> Unit
                 }
             }

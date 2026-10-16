@@ -16,7 +16,8 @@
             <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
         </activity>
         <meta-data android:name="com.google.ar.core" android:value="optional" />
-        <receiver android:name=".update.InstallResultReceiver" android:exported="false" />
+        <activity android:name=".update.InstallActivity" android:exported="false" android:excludeFromRecents="true" android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" android:launchMode="singleTop" />
         <provider android:name="androidx.core.content.FileProvider" android:authorities="${applicationId}.files"
             android:exported="false" android:grantUriPermissions="true">
             <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" />
