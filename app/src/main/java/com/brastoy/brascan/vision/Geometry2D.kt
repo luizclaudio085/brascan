@@ -139,7 +139,12 @@ data class ShapeFit(
 )
 
 object ShapeClassifier {
-    fun classify(m: Mask): ShapeFit? {
+    @JvmField var realCornerRule = true
+    /**
+     * [occluded]: células (mesmo recorte de [m]) ocupadas por OUTRA peça. Um vão do casco que é na verdade outra
+     * peça na frente não é entalhe da forma (parede atrás de parede virava "L"/"porta"/"E").
+     */
+    fun classify(m: Mask, occluded: Mask? = null): ShapeFit? {
         val cells = m.count(); if (cells < 6) return null
         val hull = Geo2.hull(m.edgePoints()); if (hull.size < 3) return null
         val hullA = Geo2.area(hull); val obb = Geo2.minAreaRect(hull)
@@ -155,9 +160,25 @@ object ShapeClassifier {
             return hit >= 3
         }
         // faixa fina colada na borda = borda/ímã que não foi segmentado, não é forma da peça
-        val gaps = gaps(m, hull, hullA, obb).filterNot { g -> (g.su < .2f && abs(g.cu) > .33f) || (g.sv < .2f && abs(g.cv) > .33f) }
+        val gaps = gaps(m, hull, hullA, obb, occluded).filterNot { g -> (g.su < .2f && abs(g.cu) > .33f) || (g.sv < .2f && abs(g.cv) > .33f) }
         val holes = gaps.filter { it.enclosed }; val notches = gaps.filter { !it.enclosed }
-        val tri = corners.size == 3 || (rect < .7f && solidity > .8f)
+        // triângulo = casco com 3 cantos de verdade (canto quase reto, > 145°, é hipotenusa digitalizada ou canto arredondado).
+        // Um quadrado visto de viés vira paralelogramo (retangularidade baixa) com 4 cantos de verdade e NÃO é
+        // triângulo: a regra antiga (só rect < .7) transformava paredes em "isósceles"
+        val realCorners = corners.indices.count { i ->
+            val p = corners[(i - 1 + corners.size) % corners.size]; val c = corners[i]; val q = corners[(i + 1) % corners.size]
+            val a = p - c; val b = q - c; a.dot(b) / kotlin.math.max(a.len() * b.len(), 1e-6f) > -0.819f // ângulo < 145° (canto arredondado partido em dois dá ~150°)
+        }
+        // paralelogramo = 4 cantos de verdade com lados opostos paralelos (≤ 15°): quadrado/retângulo visto de viés
+        // (lados opostos também de comprimento parecido e casco bem preenchido: um triângulo com um 4º canto
+        // espúrio tem um lado minúsculo e falha aqui)
+        val parallelogram = realCornerRule && realCorners == 4 && corners.size == 4 && solidity > .88f && run {
+            fun par(a: P2, b: P2): Boolean { val c = abs(a.cross(b)) / max(a.len() * b.len(), 1e-6f); return c < .18f }
+            fun similar(a: P2, b: P2): Boolean { val r = a.len() / max(b.len(), 1e-6f); return r in .6f..1.67f }
+            val e0 = corners[1] - corners[0]; val e1 = corners[2] - corners[1]; val e2 = corners[3] - corners[2]; val e3 = corners[0] - corners[3]
+            par(e0, e2) && par(e1, e3) && similar(e0, e2) && similar(e1, e3)
+        }
+        val tri = !parallelogram && (corners.size == 3 || (rect < .7f && solidity > .8f))
 
         val shape = when {
             holes.size >= 3 -> "janela" // janela de 4 vidros
@@ -189,7 +210,7 @@ object ShapeClassifier {
      */
     private fun hypotF(a: Float, b: Float) = kotlin.math.sqrt(a * a + b * b)
 
-    private fun gaps(m: Mask, hull: List<P2>, hullA: Float, obb: OBB): List<Gap> {
+    private fun gaps(m: Mask, hull: List<P2>, hullA: Float, obb: OBB, occluded: Mask? = null): List<Gap> {
         fun inHull(x: Float, y: Float): Boolean {
             for (i in hull.indices) if ((hull[(i + 1) % hull.size] - hull[i]).cross(P2(x, y) - hull[i]) < 0) return false
             return true
@@ -199,6 +220,8 @@ object ShapeClassifier {
         for (y in 0 until m.h) for (x in 0 until m.w) if (inHull(x + .5f, y + .5f)) { hullCell[x, y] = true; if (!m[x, y]) gap[x, y] = true }
         val out = ArrayList<Gap>()
         for (c in gap.erode().dilate().components(minCells = max(3, (hullA * .025f).toInt()))) {
+            // vão ocupado por outra peça (≥ 50% das células): oclusão, não forma
+            if (occluded != null) { var occ = 0; var tot = 0; for (y in 0 until c.h) for (x in 0 until c.w) if (c[x, y]) { tot++; if (occluded[x, y]) occ++ }; if (tot > 0 && occ * 2 >= tot) continue }
             var touches = false
             var su0 = Float.MAX_VALUE; var su1 = -Float.MAX_VALUE; var sv0 = Float.MAX_VALUE; var sv1 = -Float.MAX_VALUE; var cu = 0f; var cv = 0f; var k = 0
             for (y in 0 until c.h) for (x in 0 until c.w) if (c[x, y]) {

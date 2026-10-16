@@ -41,7 +41,7 @@ class DiagReplayProbe {
             val up = o.optJSONArray("up")?.let { a -> DoubleArray(3) { a.getDouble(it) } }
             val t0 = System.nanoTime()
             val seg = Segmenter.segment(rgb, w, h, minFrac = .0015f)
-            val dets = slam.track(seg, up)
+            val dets = slam.track(seg, up, rgb)
             val ms = (System.nanoTime() - t0) / 1e6
             val phone = o.getJSONArray("dets")
             totalDets += dets.size; phoneDets += phone.length(); if (dets.size == phone.length()) agreeDets++

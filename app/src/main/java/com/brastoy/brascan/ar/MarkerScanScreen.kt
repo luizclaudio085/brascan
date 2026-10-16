@@ -71,6 +71,7 @@ import com.brastoy.brascan.vision.Piece3D
 import com.brastoy.brascan.vision.PieceSlam
 import com.brastoy.brascan.vision.Segmenter
 import java.util.concurrent.Executors
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.sqrt
 
@@ -172,7 +173,13 @@ fun MarkerScanScreen(initialMap: String? = null, onClose: () -> Unit, onDone: (L
 private class Engine(private val ctx: Context, private var initialMap: String?, private val publish: (MarkerStatus) -> Unit, private val onPreviewKind: (Boolean) -> Unit) : SensorEventListener {
     private val exec = Executors.newSingleThreadExecutor()
     private val sm = ctx.getSystemService(Context.SENSOR_SERVICE) as SensorManager
-    @Volatile private var gravity: FloatArray? = null
+    /** Amostras de gravidade com carimbo de tempo (ns do relógio dos sensores): o quadro usa a mais próxima dele. */
+    private val gravRing = ArrayDeque<Pair<Long, FloatArray>>()
+    private val gravLock = Any()
+    private var gravEma: FloatArray? = null
+    private var gravFromAccel = false
+    /** O relógio dos quadros da câmera é o mesmo dos sensores (SENSOR_INFO_TIMESTAMP_SOURCE = REALTIME)? */
+    @Volatile private var camClockRealtime = false
     @Volatile private var slam: PieceSlam? = null
     private var intr: Intrinsics? = null
     private var sensorOrientation = 90
@@ -189,10 +196,32 @@ private class Engine(private val ctx: Context, private var initialMap: String?, 
     }
 
     fun startSensors() {
-        (sm.getDefaultSensor(Sensor.TYPE_GRAVITY) ?: sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER))?.let { sm.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+        // gravidade filtrada pelo sistema; sem ela, acelerômetro cru com média móvel e rejeição de solavancos
+        val g = sm.getDefaultSensor(Sensor.TYPE_GRAVITY)
+        val sensor = g ?: sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER) ?: return
+        gravFromAccel = g == null
+        sm.registerListener(this, sensor, SensorManager.SENSOR_DELAY_GAME)
     }
-    override fun onSensorChanged(e: SensorEvent) { gravity = e.values.clone() }
+    override fun onSensorChanged(e: SensorEvent) {
+        var v = e.values.clone()
+        if (gravFromAccel) {
+            // mão/passos somam 2-3 m/s² à gravidade: descarta amostras longe de 9,81 e suaviza o resto
+            val n = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+            if (abs(n - 9.81f) > 1.5f) return
+            val ema = gravEma
+            v = if (ema == null) v else FloatArray(3) { ema[it] + (v[it] - ema[it]) * .12f }
+            gravEma = v
+        }
+        synchronized(gravLock) { gravRing.addLast(e.timestamp to v); while (gravRing.size > 64) gravRing.removeFirst() }
+    }
     override fun onAccuracyChanged(s: Sensor?, a: Int) {}
+
+    /** Gravidade no instante do quadro ([tsNs] no relógio dos sensores), ou a mais recente se os relógios diferem. */
+    private fun gravityAt(tsNs: Long): FloatArray? = synchronized(gravLock) {
+        if (gravRing.isEmpty()) return null
+        if (!camClockRealtime) return gravRing.last().second
+        gravRing.minByOrNull { abs(it.first - tsNs) }?.second
+    }
 
     fun stop() { sm.unregisterListener(this); provider?.unbindAll(); exec.shutdown() }
     /** Recomeçar do zero (também serve para ignorar um mapa salvo que não está batendo). */
@@ -209,8 +238,11 @@ private class Engine(private val ctx: Context, private var initialMap: String?, 
         f.addListener({
             val p = f.get(); provider = p
             val preview = Preview.Builder().build().also { it.setSurfaceProvider(pv.surfaceProvider) }
-            @Suppress("DEPRECATION")
-            val analysis = ImageAnalysis.Builder().setTargetResolution(Size(640, 480))
+            // 640×480 de verdade (setTargetResolution era interpretado já girado e vinha 960×720+ reduzido por vizinho)
+            val analysis = ImageAnalysis.Builder()
+                .setResolutionSelector(androidx.camera.core.resolutionselector.ResolutionSelector.Builder()
+                    .setAspectRatioStrategy(androidx.camera.core.resolutionselector.AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                    .setResolutionStrategy(androidx.camera.core.resolutionselector.ResolutionStrategy(Size(640, 480), androidx.camera.core.resolutionselector.ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build())
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
             analysis.setAnalyzer(exec) { img ->
                 // uma exceção no quadro não pode derrubar a câmera, mas também não pode sumir em silêncio
@@ -225,6 +257,7 @@ private class Engine(private val ctx: Context, private var initialMap: String?, 
             poll()
             val info = Camera2CameraInfo.from(cam.cameraInfo)
             sensorOrientation = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+            camClockRealtime = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) == CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME
             calib = Calib(
                 info.getCameraCharacteristic(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION),
                 info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)?.let { it.width() to it.height() },
@@ -253,8 +286,8 @@ private class Engine(private val ctx: Context, private var initialMap: String?, 
     }
 
     /** "Para cima" no sistema da câmera (x direita, y baixo, z para frente do sensor), a partir da gravidade do aparelho. */
-    private fun upInCamera(): DoubleArray? {
-        val g = gravity ?: return null
+    private fun upInCamera(tsNs: Long): DoubleArray? {
+        val g = gravityAt(tsNs) ?: return null
         val n = sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]); if (n < 1f) return null
         val dx = g[0] / n; val dy = g[1] / n; val dz = g[2] / n
         // aparelho (x direita, y para cima, z para fora da tela) → imagem em pé (x direita, y baixo) → sensor girado
@@ -266,14 +299,15 @@ private class Engine(private val ctx: Context, private var initialMap: String?, 
 
     private fun process(img: androidx.camera.core.ImageProxy) {
         val image = img.image ?: return
+        // gravidade do instante do quadro, não de depois da segmentação (a mão continua girando enquanto processa)
+        val up = upInCamera(img.imageInfo.timestamp)
         val outW = 480
         val (rgb, w, h) = ArScanView.yuvToArgb(image, outW)
         val k = intr ?: intrinsics(w, h).also { intr = it }
         val s = slam ?: PieceSlam(k).also { sl -> initialMap?.let { sl.restore(it) }; slam = sl }
         val t0 = SystemClock.elapsedRealtime()
         val seg = Segmenter.segment(rgb, w, h, minFrac = .0015f)
-        val up = upInCamera()
-        val dets = s.track(seg, up)
+        val dets = s.track(seg, up, rgb)
         val now = SystemClock.elapsedRealtime()
         val rot0 = img.imageInfo.rotationDegrees; lastRot = rot0
         overlay?.frame = OverlayFrame(s.camera, s.lost, k, w, h, rot0, s.map.map { it.toPiece3D() to it.count })
@@ -293,7 +327,7 @@ private class Engine(private val ctx: Context, private var initialMap: String?, 
             dets.isEmpty() -> "Não vejo peças: aproxime e melhore a luz"
             s.lost -> "Perdi a posição: volte a mostrar peças já vistas"
             s.map.size < 2 -> "Ótimo! Agora ande em volta devagar"
-            pieces.isEmpty() -> "Continue: cada peça precisa aparecer em 3 quadros"
+            pieces.isEmpty() -> "Continue andando devagar: cada peça precisa ser vista de ${PieceSlam.MIN_VIEWS} lugares"
             else -> "${pieces.size} peças no modelo — mostre os outros lados para refinar"
         }
         publish(MarkerStatus(hint, !s.lost, s.map.size, pieces, dets.map { d -> d.imgCorners.map { upright(it[0], it[1]) } to d.color }, uw, uh, fps, up != null,

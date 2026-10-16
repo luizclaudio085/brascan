@@ -11,6 +11,7 @@ import com.brastoy.brascan.three.Scene
 import com.brastoy.brascan.three.TileMesh
 import com.brastoy.brascan.three.V3
 import com.brastoy.brascan.vision.Catalog
+import com.brastoy.brascan.vision.PieceSlam
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.roundToInt
@@ -48,10 +49,10 @@ class ArOverlayView(ctx: Context, onTopOfWindow: Boolean) : GLSurfaceView(ctx), 
         val f = frame ?: return
         val cam = f.cam ?: return
         // a cena só é refeita quando alguma peça muda de lugar (> 5 mm / ~3°) ou de estado, no máximo ~6×/s
-        val key = f.pieces.map { (p, n) -> listOf(p.shape, p.size, p.color, n >= 3, q(p.center, 200f), q(p.u, 20f), q(p.v, 20f)) } + f.lost
+        val key = f.pieces.map { (p, n) -> listOf(p.shape, p.size, p.color, n >= PieceSlam.MIN_VIEWS, q(p.center, 200f), q(p.u, 20f), q(p.v, 20f)) } + f.lost
         val now = System.currentTimeMillis()
         if (key != sceneKey && (sceneKey == null || now - lastBuild > 150)) {
-            scene = Scene().also { s -> for ((p, n) in f.pieces) TileMesh.build(s, p.shape, p.size, p.center, p.u, p.v, Catalog.edgeM(p.size), Color(p.color), -1, false, shadow = false, ghost = if (f.lost) .3f else if (n >= 3) .85f else .4f) }
+            scene = Scene().also { s -> for ((p, n) in f.pieces) TileMesh.build(s, p.shape, p.size, p.center, p.u, p.v, Catalog.edgeM(p.size), Color(p.color), -1, false, shadow = false, ghost = if (f.lost) .3f else if (n >= PieceSlam.MIN_VIEWS) .85f else .4f) }
             sceneKey = key; lastBuild = now
         }
         OverlayMath.viewMatrix(cam, view)
