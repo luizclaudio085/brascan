@@ -35,7 +35,7 @@ jobs:
         with:
           node-version: 22
 
-      - name: Codec B5 (ida e volta com códigos reais do simulador)
+      - name: Codec B8 do simulador (ida e volta com códigos reais)
         run: node tools/testar_codec.cjs
 
       - name: Chave de assinatura
