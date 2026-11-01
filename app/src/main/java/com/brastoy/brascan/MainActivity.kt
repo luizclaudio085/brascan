@@ -112,12 +112,23 @@ private fun App() {
         }
     }
 
+    LaunchedEffect(Unit) { Updater.justUpdated(ctx)?.let { com.brastoy.brascan.ui.toast(ctx, "BraScan atualizado para a versão $it") } }
     // Checa o GitHub a cada 30 s enquanto o app está aberto: push na main → APK novo no celular em poucos minutos.
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     LaunchedEffect(Unit) {
         lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
             while (true) { Updater.tick(ctx); delay(30_000) }
         }
+    }
+    // versão nova já baixada instala quando o usuário sai do app (instalar fecha o app: não interrompe o uso)
+    androidx.compose.runtime.DisposableEffect(lifecycle) {
+        val obs = androidx.lifecycle.LifecycleEventObserver { _, e -> if (e == Lifecycle.Event.ON_STOP) Updater.onBackground(ctx) }
+        lifecycle.addObserver(obs); onDispose { lifecycle.removeObserver(obs) }
+    }
+    // o sistema pediu confirmação logo depois de um toque em "Atualizar": abre a tela "Instalar?" daqui (na frente)
+    LaunchedEffect(update) {
+        if (update is Updater.State.NeedsConfirm && Updater.confirmRequestedByUser() && lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+            (ctx as? android.app.Activity)?.let { Updater.openConfirm(it) }
     }
 
     if (countOpen) {
@@ -193,7 +204,8 @@ private fun Header(update: Updater.State, onUpdate: () -> Unit) = Row(
 private fun UpdateBanner(s: Updater.State) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
-    val visible = s is Updater.State.Available || s is Updater.State.Downloading || s is Updater.State.NeedsPermission || s is Updater.State.Installing || (s is Updater.State.Failed && s.remote != null)
+    val visible = s is Updater.State.Available || s is Updater.State.Downloading || s is Updater.State.NeedsPermission || s is Updater.State.Installing ||
+        s is Updater.State.Ready || s is Updater.State.NeedsConfirm || (s is Updater.State.Failed && s.remote != null)
     AnimatedVisibility(visible) {
         GlassCard(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -204,16 +216,22 @@ private fun UpdateBanner(s: Updater.State) {
                         is Updater.State.Downloading -> "Baixando ${s.remote.name}…"
                         is Updater.State.NeedsPermission -> "Libere a instalação para atualizar"
                         is Updater.State.Installing -> "Instalando ${s.remote.name}…"
+                        is Updater.State.Ready -> "Versão ${s.remote.name} pronta"
+                        is Updater.State.NeedsConfirm -> "Confirme a atualização para ${s.remote.name}"
                         is Updater.State.Failed -> "Versão ${s.remote?.name} não instalou"
                         else -> ""
                     }, color = Color.White, fontWeight = FontWeight.SemiBold)
                     if (s is Updater.State.NeedsPermission) Text("Só precisa fazer uma vez", color = Palette.muted, fontSize = 12.sp)
+                    if (s is Updater.State.Ready) Text(if (s.silent) "Instala sozinha quando você sair do app (o app fecha ao instalar)" else "Toque em Instalar e confirme", color = Palette.muted, fontSize = 12.sp)
+                    if (s is Updater.State.NeedsConfirm) Text("O Android pede uma confirmação desta vez", color = Palette.muted, fontSize = 12.sp)
                     if (s is Updater.State.Failed) Text(s.message, color = Palette.muted, fontSize = 12.sp)
                 }
                 when (s) {
-                    is Updater.State.Available -> Button(onClick = { scope.launch { Updater.tick(ctx, force = true) } }) { Text("Atualizar") }
+                    is Updater.State.Available -> Button(onClick = { scope.launch { Updater.installNow(ctx) } }) { Text("Atualizar") }
+                    is Updater.State.Ready -> Button(onClick = { scope.launch { Updater.installNow(ctx) } }) { Text(if (s.silent) "Instalar agora" else "Instalar") }
+                    is Updater.State.NeedsConfirm -> Button(onClick = { (ctx as? android.app.Activity)?.let { Updater.openConfirm(it) } }) { Text("Instalar") }
                     is Updater.State.NeedsPermission -> Button(onClick = { ctx.startActivity(Updater.permissionIntent(ctx)) }) { Text("Liberar") }
-                    is Updater.State.Failed -> Button(onClick = { scope.launch { Updater.retry(ctx) } }) { Text("Tentar de novo") }
+                    is Updater.State.Failed -> Button(onClick = { scope.launch { Updater.installNow(ctx) } }) { Text("Tentar de novo") }
                     else -> Unit
                 }
             }
@@ -240,6 +258,8 @@ private fun Settings(update: Updater.State) {
                 is Updater.State.Downloading -> "Baixando ${(update.progress * 100).toInt()}%"
                 is Updater.State.NeedsPermission -> "Falta liberar \"instalar apps desconhecidos\" para o BraScan"
                 is Updater.State.Installing -> "Instalando…"
+                is Updater.State.Ready -> if (update.silent) "Versão ${update.remote.name} baixada: instala quando você sair do app" else "Versão ${update.remote.name} baixada: toque em Instalar"
+                is Updater.State.NeedsConfirm -> "Falta confirmar a instalação da ${update.remote.name}"
                 Updater.State.Idle -> "Aguardando"
             }, color = if (update is Updater.State.Failed) Palette.pink else Palette.muted, fontSize = 13.sp, modifier = Modifier.padding(top = 4.dp))
             if (last > 0) Text("Última verificação: ${DateFormat.getTimeInstance().format(Date(last))} · repete a cada 30 s", color = Palette.muted, fontSize = 12.sp)

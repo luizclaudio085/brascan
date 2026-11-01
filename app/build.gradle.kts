@@ -56,3 +56,10 @@ dependencies {
     implementation("androidx.camera:camera-view:1.3.4")
     testImplementation("junit:junit:4.13.2")
 }
+
+tasks.withType<Test>().configureEach {
+    // classes de teste divididas entre JVMs (o CI do GitHub tem 4 núcleos)
+    maxParallelForks = (Runtime.getRuntime().availableProcessors() / 2).coerceAtLeast(1)
+    // sondas (*Probe) só medem e imprimem números, não são regressão: no CI ficam de fora (publicação mais rápida)
+    if (System.getenv("CI") == "true") exclude("**/*Probe*")
+}
