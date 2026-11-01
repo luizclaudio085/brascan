@@ -53,7 +53,8 @@ jobs:
           BRASCAN_KEY_PASSWORD: ${{ secrets.BRASCAN_STORE_PASSWORD }}
         run: |
           chmod +x gradlew
-          ./gradlew --no-daemon testDebugUnitTest assembleRelease
+          # testes sobre a mesma compilação do APK (release): o Kotlin é compilado uma vez só
+          ./gradlew --no-daemon --build-cache testReleaseUnitTest assembleRelease
           cp app/build/outputs/apk/release/app-release.apk brascan.apk
 
       - name: Publicar release
