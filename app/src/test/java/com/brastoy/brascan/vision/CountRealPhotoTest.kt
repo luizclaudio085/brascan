@@ -34,6 +34,8 @@ class CountRealPhotoTest {
 
     @Test fun realPhotos() {
         val e = listOf("todas", "janelas", "tamanhos").associateWith(::error)
+        // 400 px: o encaixe solto mede ~37 px, abaixo do mínimo do teste de ímãs (40 px), e sai quadrado médio; em 640 px
+        // (a resolução do app, ver appResolution) ele é reconhecido e só a ameia incolor escapa
         assertTrue("todas: erro ${e["todas"]}", e.getValue("todas") <= 2)
         assertTrue("janelas: erro ${e["janelas"]}", e.getValue("janelas") == 0)
         assertTrue("tamanhos: erro ${e["tamanhos"]}", e.getValue("tamanhos") == 0)
@@ -43,5 +45,8 @@ class CountRealPhotoTest {
     @Test fun appResolution() {
         val e = listOf("todas", "janelas", "tamanhos").associateWith { error(it + "_640") }
         println("na resolução do app: $e")
+        assertTrue("todas: erro ${e["todas"]}", e.getValue("todas") <= 1)
+        assertTrue("janelas: erro ${e["janelas"]}", e.getValue("janelas") == 0)
+        assertTrue("tamanhos: erro ${e["tamanhos"]}", e.getValue("tamanhos") == 0)
     }
 }

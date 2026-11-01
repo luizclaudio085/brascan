@@ -26,7 +26,18 @@ class Blob(
 
 class Segmentation(val w: Int, val h: Int, val labels: IntArray, val blobs: List<Blob>,
                    /** Luminância e primeiro plano por pixel: o detector usa para tentar dividir uma região que não fecha com molde nenhum. */
-                   val L: FloatArray? = null, val fg: BooleanArray? = null)
+                   val L: FloatArray? = null, val fg: BooleanArray? = null,
+                   /** a*, b* (Lab) por pixel: o detector confere o matiz do painel translúcido que fica fora da região do aro. */
+                   val A: FloatArray? = null, val B: FloatArray? = null,
+                   /** Pixels de ímã (mancha escura pequena colada numa peça), fora das regiões; o detector de fotos junta à peça. */
+                   val magnet: BooleanArray? = null,
+                   /** Cor do fundo (L, a*, b*). */
+                   val bgLab: FloatArray? = null,
+                   /** Pixels de entrada (ARGB): o detector de fotos compara a cor de um furo com a da peça e mede o croma dos ímãs. */
+                   val rgb: IntArray? = null)
+
+/** Região crescida, antes de juntar pedaços: pixels de cor, a* e b* médios menos os do fundo, L* médio e caixa. */
+internal class Reg(val cnt: Int, val da: Double, val db: Double, val l: Double, val x0: Int, val y0: Int, val x1: Int, val y1: Int)
 
 /**
  * Segmentação em Kotlin puro (igual no celular e nos testes), feita para fotos reais:
@@ -37,6 +48,11 @@ class Segmentation(val w: Int, val h: Int, val labels: IntArray, val blobs: List
  *    a MESMA peça e tem o mesmo matiz; comparar a distância em a/b partia a peça em aro + painel + 4 triângulos
  *    (daí os falsos "triângulos" e tamanhos "médio" na cena realista);
  * 4. fechamento morfológico pequeno: ímãs escuros e reflexos dentro da peça não quebram a região.
+ * Com peças SOLTAS (segment(loose = true): foto do inventário, contagem; o scanner 3D não usa):
+ * 5. junta os pedaços da mesma peça (aro, painel, vincos) que o crescimento separou — mesmo matiz, croma e brilho
+ *    parecidos, borda em comum — e só então aplica o tamanho mínimo (peça pequena era só pedaços abaixo dele);
+ * 6. peça pequena (abaixo do mínimo antigo) entra se tiver a cor das peças grandes da foto;
+ * 7. marca os ímãs (manchas escuras coladas numa peça) para o detector de fotos juntar à peça.
  */
 object Segmenter {
     const val BINS = 12
@@ -48,6 +64,23 @@ object Segmenter {
     @JvmField var ringBackground = true
     private val HUE_18 = kotlin.math.cos(Math.toRadians(18.0)).toFloat()
     private val HUE_22 = kotlin.math.cos(Math.toRadians(22.0)).toFloat()
+    /**
+     * Junta regiões vizinhas que são pedaços da mesma peça (aro, painel, vincos): dividem ≥ [joinContact] da borda da
+     * menor, matiz (visto do fundo) a ≤ [joinHueDeg], croma ≥ [joinMinChroma] do da outra e brilho a ≤ [joinMaxDL].
+     */
+    @JvmField var joinParts = true
+    @JvmField var joinContact = .3f
+    @JvmField var joinHueDeg = 14f
+    @JvmField var joinMinChroma = .5
+    @JvmField var joinMaxDL = 20.0
+    /** Peça pequena (entre smallFrac e minFrac do quadro) só entra com croma ≥ [smallChroma] × mediana das grandes. */
+    @JvmField var smallChroma = .65
+    /** Croma de referência quando não há peça grande no quadro. */
+    @JvmField var smallChromaAbs = 25.0
+    /** Marca ímãs (Segmentation.magnet): mancha com L < [magnetDarkL] × L do fundo, quase sem cor, até [magnetMaxFrac] do quadro. */
+    @JvmField var markMagnets = true
+    @JvmField var magnetDarkL = .5f
+    @JvmField var magnetMaxFrac = .0012f
     fun hueBin(h: Float) = ((h / 30f + .5f).toInt()) % BINS
 
     fun hsv(c: Int, out: FloatArray) {
@@ -70,7 +103,14 @@ object Segmenter {
         out[0] = 116f * y - 16f; out[1] = 500f * (x - y); out[2] = 200f * (y - z)
     }
 
-    fun segment(px: IntArray, w: Int, h: Int, minFrac: Float = .002f, maxFrac: Float = .35f, maxBlobs: Int = 80, fgThreshold: Float = 13f): Segmentation {
+    /**
+     * [minFrac]: região com pelo menos essa fração do quadro (em pixels de cor) entra.
+     * [loose] (peças SOLTAS: foto do inventário, contagem; o detector de fotos usa via PhotoPieces.detect): junta os
+     * pedaços da mesma peça antes do tamanho mínimo, aceita peça pequena entre [smallFrac] e [minFrac] quando tem a cor
+     * das grandes e marca os ímãs. Desligado (padrão: scanner 3D, peças encostadas), a segmentação é a de antes.
+     */
+    fun segment(px: IntArray, w: Int, h: Int, minFrac: Float = .002f, maxFrac: Float = .35f, maxBlobs: Int = 80, fgThreshold: Float = 13f,
+                loose: Boolean = false, smallFrac: Float = minFrac * .4f): Segmentation {
         val n = w * h
         val L = FloatArray(n); val A = FloatArray(n); val B = FloatArray(n); val t = FloatArray(3)
         for (i in 0 until n) { lab(px[i], t); L[i] = t[0]; A[i] = t[1]; B[i] = t[2] }
@@ -81,10 +121,11 @@ object Segmenter {
         val ring = ArrayList<Int>(n / step / 2)
         val mx = w / 10; val my = h / 10
         for (i in 0 until n step step) { val x = i % w; val y = i / w; if (x < mx || x >= w - mx || y < my || y >= h - my) ring += i }
-        var bgA: Float; var bgB: Float
+        var bgA: Float; var bgB: Float; val bgL: Float
         run {
             val ra = ring.map { A[it] }.sorted(); val rb = ring.map { B[it] }.sorted()
             bgA = ra[ra.size / 2]; bgB = rb[rb.size / 2]
+            bgL = ring.map { L[it] }.sorted()[ring.size / 2]
             if (!ringBackground || sqrt(bgA * bgA + bgB * bgB) > 15f) {
                 val sa = (0 until n step step).map { A[it] }.sorted(); val sb = (0 until n step step).map { B[it] }.sorted()
                 bgA = sa[sa.size / 2]; bgB = sb[sb.size / 2]
@@ -94,6 +135,28 @@ object Segmenter {
         val C = FloatArray(n); val Hc = FloatArray(n); val Hs = FloatArray(n)
         for (i in 0 until n) { val c = sqrt(A[i] * A[i] + B[i] * B[i]); C[i] = c; if (c > 1e-3f) { Hc[i] = A[i] / c; Hs[i] = B[i] / c } }
         val fg = BooleanArray(n) { val da = A[it] - bgA; val db = B[it] - bgB; sqrt(da * da + db * db) > fgThreshold && L[it] > 12f }
+        // ímãs: mancha bem mais escura que o fundo (a sombra no chão escurece bem menos) e quase sem cor, do tamanho de um
+        // ímã, colada na peça. É peça, não cor da peça. Nos dentes do E os ímãs cobrem o dente inteiro: sem eles o dente some
+        // e o E vira L/porta/retângulo. Mancha escura grande (objeto escuro, fundo) fica fora. Só marca: quem junta à peça
+        // é o detector de fotos (PhotoPieces), com peças soltas; no scanner a emenda escura entre peças encostadas não é ímã.
+        val magnet = BooleanArray(n)
+        val marked = loose && markMagnets
+        if (marked) {
+            val dark = BooleanArray(n) { val da = A[it] - bgA; val db = B[it] - bgB; L[it] < magnetDarkL * bgL && sqrt(da * da + db * db) < 22f }
+            val seen = BooleanArray(n); val qq = IntArray(n); val maxCells = max(8, (n * magnetMaxFrac).toInt())
+            for (s0 in 0 until n) {
+                if (!dark[s0] || seen[s0]) continue
+                var head = 0; var tail = 0; qq[tail++] = s0; seen[s0] = true; var touches = false
+                while (head < tail) {
+                    val i = qq[head++]; val x = i % w
+                    for (k in intArrayOf(if (x > 0) i - 1 else -1, if (x < w - 1) i + 1 else -1, i - w, i + w)) {
+                        if (k < 0 || k >= n) continue
+                        if (dark[k]) { if (!seen[k]) { seen[k] = true; qq[tail++] = k } } else if (fg[k]) touches = true
+                    }
+                }
+                if (touches && tail <= maxCells) for (j in 0 until tail) magnet[qq[j]] = true
+            }
+        }
 
         // fechamento (raio ~0,5% da largura): pontes sobre ímãs, reflexos e o sulco escuro entre aro e painel;
         // esses pixels "ponte" não entram na média de cor. A emenda entre duas peças encostadas também vira ponte —
@@ -104,6 +167,7 @@ object Segmenter {
 
         val label = IntArray(n) { -1 }; val raw = IntArray(n) { -1 }; val q = IntArray(n)
         val blobs = ArrayList<Blob>()
+        val regs = ArrayList<Reg>()
         var region = 0
         for (s in 0 until n) {
             if (raw[s] >= 0 || !fg[s]) continue
@@ -111,11 +175,10 @@ object Segmenter {
             // matiz médio da região = soma dos vetores (cos, sin) pesada pelo croma (média circular) + média de a/b/L
             var sumHc = (Hc[s] * C[s]).toDouble(); var sumHs = (Hs[s] * C[s]).toDouble()
             var sumL = L[s].toDouble(); var sumA = A[s].toDouble(); var sumB = B[s].toDouble(); var cnt = 1
-            var x0 = w; var y0 = h; var x1 = 0; var y1 = 0; var rr = 0L; var gg = 0L; var bb = 0L; var colorCnt = 0
+            var x0 = w; var y0 = h; var x1 = 0; var y1 = 0
             while (head < tail) {
                 val i = q[head++]; val x = i % w; val y = i / w
                 x0 = min(x0, x); x1 = max(x1, x); y0 = min(y0, y); y1 = max(y1, y)
-                if (fg[i]) { rr += px[i] shr 16 and 255; gg += px[i] shr 8 and 255; bb += px[i] and 255; colorCnt++ }
                 val ml = sqrt(sumHc * sumHc + sumHs * sumHs).coerceAtLeast(1e-9); val mcx = (sumHc / ml).toFloat(); val mcy = (sumHs / ml).toFloat()
                 val mA = (sumA / cnt).toFloat(); val mB = (sumB / cnt).toFloat(); val mL = (sumL / cnt).toFloat()
                 for (k in intArrayOf(if (x > 0) i - 1 else -1, if (x < w - 1) i + 1 else -1, i - w, i + w)) {
@@ -139,16 +202,83 @@ object Segmenter {
                 }
             }
             region++
+            regs += Reg(cnt, sumA / cnt - bgA, sumB / cnt - bgB, sumL / cnt, x0, y0, x1, y1)
+        }
+        // Pedaços da mesma peça: o crescimento por cor separa aro (mais claro), painel (translúcido), vincos e a borda
+        // borrada quando o degrau de cor entre vizinhos passa de 7 — numa peça pequena tudo isso tem 1-3 px e nenhum
+        // pedaço sozinho chega ao tamanho mínimo (a peça sumia); num quadrado médio os vincos em X partiam o painel em 4
+        // "triângulos". São do mesmo plástico: mesmo MATIZ visto a partir do fundo, croma e brilho parecidos, e se abraçam
+        // (o aro contorna o painel, os vincos dividem o painel). Junta vizinhas assim que dividem ≥ 30% da borda da menor.
+        // Duas peças encostadas de cores diferentes têm matiz diferente (≥ 25° entre as 7 cores); lado a lado só dividem
+        // um lado (≤ 25% da borda). A borda pálida (mistura com o fundo, croma < metade) não entra: com ela as peças
+        // grandes das fotos reais cresciam e a escala de tamanho (calibrada sem ela) mudava.
+        val nr = regs.size
+        val root = IntArray(nr) { it }
+        fun find(x: Int): Int { var a = x; while (root[a] != a) { root[a] = root[root[a]]; a = root[a] }; return a }
+        if (loose && joinParts && nr > 1) {
+            val per = IntArray(nr); val contact = HashMap<Long, Int>()
+            for (i in 0 until n) {
+                val a = raw[i]; if (a < 0) continue
+                val x = i % w
+                for (k in intArrayOf(if (x > 0) i - 1 else -1, if (x < w - 1) i + 1 else -1, i - w, i + w)) {
+                    val b = if (k < 0 || k >= n) -1 else raw[k]
+                    if (b == a) continue
+                    per[a]++
+                    if (b > a) contact.merge(a.toLong() * nr + b, 1, Int::plus)
+                }
+            }
+            val cosJ = kotlin.math.cos(Math.toRadians(joinHueDeg.toDouble()))
+            // compara os GRUPOS (média pelos pixels de cor), não só o par: uma borda borrada com matiz intermediário
+            // não pode encadear duas peças (vidro da janela → borda → moldura)
+            val gn = DoubleArray(nr) { regs[it].cnt.toDouble() }; val ga = DoubleArray(nr) { regs[it].da * gn[it] }
+            val gb = DoubleArray(nr) { regs[it].db * gn[it] }; val gl = DoubleArray(nr) { regs[it].l * gn[it] }
+            val pairs = contact.entries.mapNotNull { (key, c) ->
+                val a = (key / nr).toInt(); val b = (key % nr).toInt(); val frac = c.toFloat() / min(per[a], per[b])
+                if (frac >= joinContact) Triple(a, b, frac) else null
+            }.sortedByDescending { it.third }
+            for ((a, b) in pairs) {
+                val fa = find(a); val fb = find(b); if (fa == fb) continue
+                val ax = ga[fa] / gn[fa]; val ay = gb[fa] / gn[fa]; val bx = ga[fb] / gn[fb]; val by = gb[fb] / gn[fb]
+                val la = kotlin.math.hypot(ax, ay); val lb = kotlin.math.hypot(bx, by)
+                if (la < 10.0 || lb < 10.0 || (ax * bx + ay * by) / (la * lb) < cosJ) continue // sem cor / outro matiz
+                if (min(la, lb) < joinMinChroma * max(la, lb)) continue // borda pálida
+                // aro, painel e vincos têm brilho parecido (≤ 10); peça clara encaixada numa escura não
+                if (abs(gl[fa] / gn[fa] - gl[fb] / gn[fb]) > joinMaxDL) continue
+                val keep = min(fa, fb); val gone = max(fa, fb)
+                root[gone] = keep; gn[keep] += gn[gone]; ga[keep] += ga[gone]; gb[keep] += gb[gone]; gl[keep] += gl[gone]
+            }
+        }
+        // grupos (região sozinha ou pedaços juntados)
+        val members = HashMap<Int, MutableList<Int>>()
+        for (k in 0 until nr) members.getOrPut(find(k)) { ArrayList(1) } += k
+        class Grp(val g: Int, val ms: List<Int>, val x0: Int, val y0: Int, val x1: Int, val y1: Int, val color: Int, val chroma: Double)
+        val groups = members.entries.sortedBy { it.key }.map { (g, ms) ->
+            var x0 = w; var y0 = h; var x1 = 0; var y1 = 0; var colorCnt = 0; var sa = 0.0; var sb = 0.0
+            for (k in ms) { val rg = regs[k]; x0 = min(x0, rg.x0); y0 = min(y0, rg.y0); x1 = max(x1, rg.x1); y1 = max(y1, rg.y1); colorCnt += rg.cnt; sa += rg.da * rg.cnt; sb += rg.db * rg.cnt }
+            Grp(g, ms, x0, y0, x1, y1, colorCnt, kotlin.math.hypot(sa / max(1, colorCnt), sb / max(1, colorCnt)))
+        }
+        // Peça pequena (pequeno a 45 cm: 250-450 px de 480×360, abaixo do mínimo antigo de 0,2% = 345 px): entre
+        // [smallFrac] e [minFrac] só entra se for tão colorida quanto as peças grandes da foto (croma médio ≥ [smallChroma]
+        // × mediana das grandes). Plástico incolor (a ameia transparente da foto real), reflexo, sombra colorida e borda
+        // pálida que não se juntou à peça ficam com pouca cor; peça pequena de verdade tem a cor das grandes.
+        val bigChroma = groups.filter { it.color >= n * minFrac && it.color <= n * maxFrac }.map { it.chroma }.sorted()
+        val refChroma = if (bigChroma.isEmpty()) smallChromaAbs else bigChroma[bigChroma.size / 2]
+        for (gr in groups) {
+            val x0 = gr.x0; val y0 = gr.y0; val x1 = gr.x1; val y1 = gr.y1; val g = gr.g
             val bw = x1 - x0 + 1; val bh = y1 - y0 + 1
-            if (colorCnt < n * minFrac || colorCnt > n * maxFrac || bw < 4 || bh < 4) continue
+            val small = loose && gr.color < n * minFrac
+            if (gr.color > n * maxFrac || bw < 4 || bh < 4) continue
+            if (!loose && gr.color < n * minFrac) continue
+            if (small && (gr.color < n * smallFrac || gr.chroma < smallChroma * refChroma)) continue
             val mask = Mask(bw, bh)
-            for (k in 0 until tail) { val i = q[k]; mask[i % w - x0, i / w - y0] = true }
+            if (gr.ms.size == 1) { for (yy in y0..y1) for (xx in x0..x1) if (raw[yy * w + xx] == g) mask[xx - x0, yy - y0] = true }
+            else for (yy in y0..y1) for (xx in x0..x1) { val l = raw[yy * w + xx]; if (l >= 0 && find(l) == g) mask[xx - x0, yy - y0] = true }
             // duas peças da mesma cor encostadas (ou uma atrás da outra) viram uma região só: a emenda entre elas
             // é uma fileira de ímãs escuros + degrau de brilho entre as faces. Divide por essa linha.
             val parts = if (seamSplitting) seamSplit(mask, x0, y0, w, L, fg, 0, weak = false) else listOf(mask)
-            val family = if (parts.size > 1) region else -1
+            val family = if (parts.size > 1) g else -1
             for (part in parts) {
-                val b = blobFromPart(part, x0, y0, w, px, fg, blobs.size, family, (n * minFrac).toInt()) ?: continue
+                val b = blobFromPart(part, x0, y0, w, px, fg, blobs.size, family, (n * (if (small) smallFrac else minFrac)).toInt()) ?: continue
                 for (yy in 0 until part.h) for (xx in 0 until part.w) if (part[xx, yy]) label[(y0 + yy) * w + x0 + xx] = b.id
                 blobs += b
             }
@@ -164,7 +294,7 @@ object Segmenter {
         }
         val kept = blobs.sortedByDescending { it.count }.take(maxBlobs)
         if (kept.size < blobs.size) { val ok = kept.map { it.id }.toSet(); for (i in 0 until n) if (label[i] >= 0 && label[i] !in ok) label[i] = -1 }
-        return Segmentation(w, h, label, kept, L, fg)
+        return Segmentation(w, h, label, kept, L, fg, A, B, magnet = if (marked) magnet else null, bgLab = if (loose) floatArrayOf(bgL, bgA, bgB) else null, rgb = px)
     }
 
     /** Blob a partir de uma parte ([part] no recorte que começa em [x0],[y0] da imagem de largura [w]). */

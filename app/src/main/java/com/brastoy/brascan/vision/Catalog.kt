@@ -15,6 +15,12 @@ object Catalog {
     )
     val SIZES = listOf("grande", "medio", "pequeno")
 
+    /**
+     * Tamanhos em que cada forma existe no inventário do simulador (os 30 pares do código B8, scan/Inventory.KINDS):
+     * a ameia (E) não tem pequeno e o encaixe só existe no médio; as outras existem nos três.
+     */
+    fun sizesOf(shape: String): List<String> = when (shape) { "E" -> listOf("grande", "medio"); "encaixe" -> listOf("medio"); else -> SIZES }
+
     /** Lado do quadrado grande (m). Padrão do simulador; sem régua nas fotos, confirmar se possível. */
     const val SIDE_M = .075f
     val SCALE = mapOf("grande" to 1f, "medio" to .81f, "pequeno" to .5f)

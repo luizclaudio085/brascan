@@ -1,12 +1,14 @@
 package com.brastoy.brascan.scan
 
 import android.graphics.Bitmap
+import com.brastoy.brascan.vision.GroundCam
 import com.brastoy.brascan.vision.PhotoPieces
-import com.brastoy.brascan.vision.Segmenter
 
 /**
- * Contagem de peças soltas para o inventário: o detector de fotos (Segmenter + PhotoPieces) aplicado a uma foto
- * ou a um quadro da câmera, convertido para os 30 pares tamanho/formato do simulador.
+ * Contagem de peças soltas para o inventário: o detector de peças soltas (PhotoPieces.detect: segmentação que junta
+ * aro/painel/ímãs da mesma peça, forma pelo molde de cada peça do catálogo, escala conjunta {1; 0,81; 0,5} com
+ * correção de perspectiva e teste de ímãs para o encaixe) aplicado a uma foto ou a um quadro da câmera, convertido
+ * para os 30 pares tamanho/formato do inventário B8 do simulador.
  */
 object Counting {
     /** Largura em que uma foto é analisada (mais pixels = peças pequenas mais nítidas, mas mais lento). */
@@ -29,8 +31,9 @@ object Counting {
         return order.firstNotNullOfOrNull { s -> Inventory.KINDS.firstOrNull { it.type == shape && it.size == s } } ?: Inventory.KINDS.first()
     }
 
-    fun detect(px: IntArray, w: Int, h: Int): List<Found> =
-        PhotoPieces.from(Segmenter.segment(px, w, h, maxBlobs = 60))
+    /** [cam]: intrínsecos + gravidade do quadro, quando houver (sem isso a inclinação do chão é estimada pelas peças). */
+    fun detect(px: IntArray, w: Int, h: Int, cam: GroundCam? = null): List<Found> =
+        PhotoPieces.detect(px, w, h, maxBlobs = 60, cam = cam)
             .map { d ->
                 val m = 2f // pixels
                 val cut = d.cx - d.w / 2 < m || d.cy - d.h / 2 < m || d.cx + d.w / 2 > w - m || d.cy + d.h / 2 > h - m

@@ -16,7 +16,11 @@ class CountSpeedProbe {
             val t1 = System.nanoTime(); n = PhotoPieces.from(s).size
             val t2 = System.nanoTime(); seg += t1 - t0; cls += t2 - t1
         }
-        println("$name ${w}x$h: segmentação %.0f ms, classificação %.0f ms, $n peças".format(seg / 5e6, cls / 5e6))
+        println("$name ${w}x$h: segmentação %.0f ms, classificação %.0f ms, $n peças (caminho antigo)".format(seg / 5e6, cls / 5e6))
+        repeat(2) { PhotoPieces.detect(px, w, h) }
+        var tot = 0L; var m = 0
+        repeat(5) { val t0 = System.nanoTime(); m = PhotoPieces.detect(px, w, h).size; tot += System.nanoTime() - t0 }
+        println("$name ${w}x$h: detector de peças soltas %.0f ms, $m peças".format(tot / 5e6))
     }
 
     @Test fun probe() {
