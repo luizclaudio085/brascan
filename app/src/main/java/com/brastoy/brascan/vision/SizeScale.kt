@@ -61,6 +61,11 @@ object SizeScale {
     /** Log da densidade (sem constante) do resíduo [r] = ln(lado) − ln(unidade × razão). */
     private fun logDensity(r: Float): Float { val s = if (r < 0) sigmaLow else sigmaHigh; val z = r / s; return -.5f * z * z }
 
+    /** Abaixo disto exp() em float dá exatamente 0 (exp(−110) ≈ 1,7e−48 < menor subnormal): a parcela nem é somada. */
+    private const val EXP_ZERO = -110f
+    private val UNIFORM = 1f / LOGK.size
+    private val LOGK_MIN = LOGK.min()
+
     /**
      * Verossimilhança (log) de uma medida [l] = ln(lado) dada a unidade [lu] = ln(unidade) e a proporção [pi], só entre
      * os tamanhos [ok] (proporção renormalizada entre eles; null = os três).
@@ -69,32 +74,80 @@ object SizeScale {
         var p = 0f; var z = 0f
         for (k in LOGK.indices) {
             if (ok != null && !ok[k]) continue
-            val w = pi?.get(k) ?: (1f / LOGK.size)
-            z += w; p += w * exp(logDensity(l - lu - LOGK[k]))
+            val w = pi?.get(k) ?: UNIFORM
+            // p += w·exp(d): com exp(d) = 0 exato a soma não muda (p ≥ +0)
+            z += w; val d = logDensity(l - lu - LOGK[k]); if (!(d < EXP_ZERO)) p += w * exp(d)
         }
         if (z <= 0f) return ln(OUTLIER / 1.5f)
         // densidade split-normal + piso de medida ruim, espalhada por ~1,5 em log
         return ln((1 - OUTLIER) * (p / z) / ((sigmaLow + sigmaHigh) / 2 * 2.5066f) + OUTLIER / 1.5f)
     }
 
-    private fun total(logs: FloatArray, weights: FloatArray, idx: List<Int>, lu: Float, absUnit: Float, pi: FloatArray? = null, allowed: Array<BooleanArray>? = null): Float {
+    private fun total(logs: FloatArray, weights: FloatArray, idx: IntArray, lu: Float, absUnit: Float, pi: FloatArray? = null, allowed: Array<BooleanArray>? = null): Float {
         var s = 0f
         for (i in idx) s += weights[i] * ll(logs[i], lu, pi, allowed?.get(i))
         if (absUnit > 0) { val r = (lu - ln(absUnit)) / ABS_SIGMA; s -= .5f * r * r }
         return s
     }
 
-    private fun range(logs: FloatArray, idx: List<Int>, absUnit: Float): Pair<Float, Float> {
-        var lo = idx.minOf { logs[it] }; var hi = idx.maxOf { logs[it] } - LOGK.min()
+    private fun range(logs: FloatArray, idx: IntArray, absUnit: Float): Pair<Float, Float> {
+        var lo = logs[idx[0]]; var hi = logs[idx[0]]
+        for (k in 1 until idx.size) { lo = kotlin.math.min(lo, logs[idx[k]]); hi = kotlin.math.max(hi, logs[idx[k]]) }
+        hi -= LOGK_MIN
         if (absUnit > 0) { lo = minOf(lo, ln(absUnit) - .3f); hi = max(hi, ln(absUnit) + .3f) }
         return lo - .05f to hi + .05f
     }
 
-    /** Curva da verossimilhança em ln(unidade): (início, valores no passo [step]). */
-    private fun curve(logs: FloatArray, weights: FloatArray, idx: List<Int>, absUnit: Float, step: Float = STEP, allowed: Array<BooleanArray>? = null): Pair<Float, FloatArray> {
+    /**
+     * Curva da verossimilhança em ln(unidade): (início, valores no passo [step]). [parallel]: cada ponto é independente
+     * dos outros (mesmo valor em qualquer ordem), em paralelo ([Par]) — só na curva fina de [fit], uma por foto.
+     */
+    private fun curve(logs: FloatArray, weights: FloatArray, idx: IntArray, absUnit: Float, step: Float = STEP, allowed: Array<BooleanArray>? = null, parallel: Boolean = false): Pair<Float, FloatArray> {
         val (lo, hi) = range(logs, idx, absUnit)
         val m = ((hi - lo) / step).toInt() + 1
+        if (parallel) return lo to Par.mapFloat(m) { total(logs, weights, idx, lo + it * step, absUnit, null, allowed) }
         return lo to FloatArray(m) { total(logs, weights, idx, lo + it * step, absUnit, null, allowed) }
+    }
+
+    /** Cotas de [llUpperBound] por (sigmaLow, sigmaHigh): uma por subconjunto de tamanhos (máscara de bits). */
+    private val upperCache = java.util.concurrent.ConcurrentHashMap<Long, FloatArray>()
+
+    /**
+     * Cota superior de [ll] sem proporção (pi = null, como em [bestLogLikelihood]) para uma medida qualquer, em
+     * qualquer unidade, só entre os tamanhos [ok]: com folga para os arredondamentos em float (a conta de verdade
+     * nunca passa dela). Serve para descartar hipóteses de inclinação sem calcular a escala ([GroundEstimate]).
+     * Máximo de Σₖ exp(logDensity(x − ln kₖ)) por uma grade fina em x mais a constante de Lipschitz × meio passo.
+     */
+    fun llUpperBound(ok: BooleanArray?): Float {
+        var mask = 0; for (k in LOGK.indices) if (ok == null || ok[k]) mask = mask or (1 shl k)
+        val sl = sigmaLow; val sh = sigmaHigh
+        val key = (java.lang.Float.floatToIntBits(sl).toLong() shl 32) or (java.lang.Float.floatToIntBits(sh).toLong() and 0xFFFFFFFFL)
+        val all = upperCache[key] ?: FloatArray(1 shl LOGK.size) { computeUpper(it, sl, sh) }.also { upperCache[key] = it }
+        return all[mask]
+    }
+
+    private fun computeUpper(mask: Int, sigmaLow: Float, sigmaHigh: Float): Float {
+        val ks = LOGK.indices.filter { mask and (1 shl it) != 0 }
+        if (ks.isEmpty()) return ln(OUTLIER / 1.5f) + 1e-3f
+        val sl = sigmaLow.toDouble(); val sh = sigmaHigh.toDouble()
+        fun g(r: Double): Double { val s = if (r < 0) sl else sh; val z = r / s; return kotlin.math.exp(-.5 * z * z) }
+        // fora de [min ln k, max ln k] todas as parcelas só caem: o máximo está dentro
+        val lo = ks.minOf { LOGK[it].toDouble() }; val hi = ks.maxOf { LOGK[it].toDouble() }
+        val step = 2.5e-4; var best = 0.0; var x = lo
+        while (x <= hi + step) { var s = 0.0; for (k in ks) s += g(x - LOGK[k]); if (s > best) best = s; x += step }
+        val lip = ks.size / (minOf(sl, sh) * kotlin.math.sqrt(kotlin.math.E))
+        val sum = best + lip * step / 2
+        // p/z = (Σ peso·g)/(Σ peso) com pesos iguais
+        val pz = sum / ks.size * (1 + 1e-4)
+        val d = (sigmaLow + sigmaHigh) / 2.0 * 2.5066
+        return (kotlin.math.ln((1 - OUTLIER.toDouble()) * pz / d * (1 + 1e-4) + OUTLIER / 1.5) + 1e-3).toFloat()
+    }
+
+    /** Índices das medidas que entram na escala (lado e peso > 0), em ordem. */
+    private fun usable(sides: FloatArray, weights: FloatArray): IntArray {
+        var n = 0; for (i in sides.indices) if (sides[i] > 0 && weights[i] > 0) n++
+        val out = IntArray(n); var k = 0; for (i in sides.indices) if (sides[i] > 0 && weights[i] > 0) out[k++] = i
+        return out
     }
 
     /**
@@ -102,7 +155,7 @@ object SizeScale {
      * Rápida (grade grossa + refino): é chamada para cada hipótese de inclinação do chão. [allowed]: como em [fit].
      */
     fun bestLogLikelihood(sides: FloatArray, weights: FloatArray, allowed: Array<BooleanArray>? = null): Float {
-        val idx = sides.indices.filter { sides[it] > 0 && weights[it] > 0 }; if (idx.isEmpty()) return 0f
+        val idx = usable(sides, weights); if (idx.isEmpty()) return 0f
         val logs = FloatArray(sides.size) { if (sides[it] > 0) ln(sides[it]) else 0f }
         val coarse = sigmaHigh / 2
         val (lo, c) = curve(logs, weights, idx, 0f, coarse, allowed)
@@ -118,13 +171,13 @@ object SizeScale {
      * [allowed] (opcional, [allowedFor]): tamanhos possíveis de cada medida pela forma (inventário do simulador).
      */
     fun fit(sides: FloatArray, weights: FloatArray, absUnit: Float = 0f, allowed: Array<BooleanArray>? = null): Fit {
-        val idx = sides.indices.filter { sides[it] > 0 && weights[it] > 0 }
+        val idx = usable(sides, weights)
         if (idx.isEmpty()) {
             val u = if (absUnit > 0) absUnit else sides.maxOrNull()?.takeIf { it > 0 } ?: 1f
             return assign(sides, u, if (absUnit > 0) .5f else 0f, ambiguous = absUnit <= 0, absolute = absUnit > 0, pi = null, allowed = allowed)
         }
         val logs = FloatArray(sides.size) { if (sides[it] > 0) ln(sides[it]) else 0f }
-        val (lo, score) = curve(logs, weights, idx, absUnit, allowed = allowed)
+        val (lo, score) = curve(logs, weights, idx, absUnit, allowed = allowed, parallel = true)
         val m = score.size
         val best = score.max()
         // picos (máximos locais) quase empatados com o melhor, distintos se separados por mais de 0,1 em log
@@ -152,7 +205,7 @@ object SizeScale {
     }
 
     /** Proporção de cada tamanho dada a unidade (EM; Dirichlet(1) para nenhum tamanho sumir por uma peça só). */
-    private fun mixture(logs: FloatArray, weights: FloatArray, idx: List<Int>, lu: Float, allowed: Array<BooleanArray>? = null): FloatArray {
+    private fun mixture(logs: FloatArray, weights: FloatArray, idx: IntArray, lu: Float, allowed: Array<BooleanArray>? = null): FloatArray {
         var pi = FloatArray(LOGK.size) { 1f / LOGK.size }
         repeat(10) {
             val acc = FloatArray(LOGK.size) { 1f }; var tw = LOGK.size.toFloat()

@@ -30,6 +30,9 @@ data class PhotoPiece(val cx: Float, val cy: Float, val w: Float, val h: Float, 
  * do grande, [SizeScale]).
  *
  * Só para peças soltas (fotos, contagem do inventário); o scanner 3D usa as regiões do Segmenter direto.
+ *
+ * Velocidade: o trabalho de cada peça (máscara, molde, giro, contorno) e de cada hipótese de inclinação roda em
+ * paralelo ([Par]) e volta na ordem de sempre; a saída é idêntica à sequencial (DetectorGoldenTest).
  */
 object PhotoPieces {
     private val FRAMES = setOf("moldura", "porta", "janela")
@@ -107,9 +110,14 @@ object PhotoPieces {
      */
     fun from(seg: Segmentation, cam: GroundCam? = null): List<PhotoPiece> = analyze(seg, cam).pieces
 
-    private val catalogHullArea = HashMap<String, Float>()
-    private fun hullArea(shape: String) = synchronized(catalogHullArea) {
-        catalogHullArea.getOrPut(shape) { Geo2.area(Geo2.hull(Catalog.polygon(shape).map { P2(it.first, it.second) })) }
+    // sem trava: lido em paralelo por cada hipótese de inclinação (o valor é o mesmo, calculado uma vez por forma)
+    private val catalogHullArea = java.util.concurrent.ConcurrentHashMap<String, Float>()
+    private fun hullArea(shape: String): Float =
+        catalogHullArea[shape] ?: Geo2.area(Geo2.hull(Catalog.polygon(shape).map { P2(it.first, it.second) })).also { catalogHullArea[shape] = it }
+    /** Comprimento (maior lado da caixa) do molde do E, em lados. */
+    private val eLong: Float by lazy {
+        val p = Catalog.polygon("E")
+        maxOf(p.maxOf { it.first } - p.minOf { it.first }, p.maxOf { it.second } - p.minOf { it.second })
     }
 
     /**
@@ -123,28 +131,36 @@ object PhotoPieces {
      * duas medidas concordam; senão vale a caixa.
      */
     fun measureWithTrust(hull: List<P2>, shape: String, iou: Float): Pair<Float, Float> {
-        if (hull.size < 3) return 0f to 0f
+        val out = FloatArray(2)
+        measureInto(FloatArray(hull.size) { hull[it].x }, FloatArray(hull.size) { hull[it].y }, hull.size, shape, iou, out)
+        return out[0] to out[1]
+    }
+
+    /**
+     * [measureWithTrust] com o casco em arrays ([n] vértices): lado em out[0], confiança em out[1]. Caixa mínima e área
+     * pelas mesmas contas de [Geo2.minAreaRect] e [Geo2.area] ([HullOps]); é o laço quente da estimativa da inclinação.
+     */
+    internal fun measureInto(xs: FloatArray, ys: FloatArray, n: Int, shape: String, iou: Float, out: FloatArray) {
+        if (n < 3) { out[0] = 0f; out[1] = 0f; return }
+        val box = FloatArray(2); HullOps.minRectWH(xs, ys, n, box)
         // ameia (E): os dentes ficam cobertos pelos ímãs e às vezes não entram na região (sobra só a espinha); a
         // largura e a área dependem disso, o comprimento (espinha = 1 lado do molde) não
-        if (shape == "E" && eByLength && sideMode == SideMode.ADAPT) {
-            val b = Geo2.minAreaRect(hull); val p = Catalog.polygon("E")
-            val long = maxOf(p.maxOf { it.first } - p.minOf { it.first }, p.maxOf { it.second } - p.minOf { it.second })
-            return maxOf(b.w, b.h) / long to 0f
-        }
+        if (shape == "E" && eByLength && sideMode == SideMode.ADAPT) { out[0] = maxOf(box[0], box[1]) / eLong; out[1] = 0f; return }
         val tri = shape == "equilatero" || shape == "retanguloTri" || shape == "isoceles"
-        val o = Geo2.minAreaRect(hull).let { Catalog.sideFromBox(shape, it.w, it.h) }
-        val a = sqrt(Geo2.area(hull) / hullArea(shape))
-        if (o <= 0f || a <= 0f) return max(o, a) to 0f
+        val o = Catalog.sideFromBox(shape, box[0], box[1])
+        val a = sqrt(HullOps.area(xs, ys, n) / hullArea(shape))
+        if (o <= 0f || a <= 0f) { out[0] = max(o, a); out[1] = 0f; return }
         val d = ln(o / a) / .1f
         val trust = max(((iou - .45f) / .3f).coerceIn(0f, 1f), exp(-d * d))
-        return when (sideMode) {
+        out[0] = when (sideMode) {
             // pontas de triângulo perdem proporcionalmente mais pixels (borda + ímãs); 1,1 calibrado nas fotos reais
             SideMode.OBB_TRI -> o * (if (tri) 1.1f else 1f)
             SideMode.OBB -> o
             SideMode.AREA -> a
             SideMode.MIX -> sqrt(o * a)
             SideMode.ADAPT -> exp(trust * ln(a) + (1 - trust) * ln(o))
-        } to trust
+        }
+        out[1] = trust
     }
 
     fun measure(hull: List<P2>, shape: String, iou: Float = 1f): Float = measureWithTrust(hull, shape, iou).first
@@ -166,7 +182,9 @@ object PhotoPieces {
             var head = 0; var tail = 0; q[tail++] = s0; seen[s0] = true; var owner = -1; var many = false
             while (head < tail) {
                 val i = q[head++]; val x = i % w
-                for (k in intArrayOf(if (x > 0) i - 1 else -1, if (x < w - 1) i + 1 else -1, i - w, i + w)) {
+                // vizinhos esquerda, direita, cima, baixo (sem alocar um array por pixel)
+                for (d in 0 until 4) {
+                    val k = when (d) { 0 -> if (x > 0) i - 1 else -1; 1 -> if (x < w - 1) i + 1 else -1; 2 -> i - w; else -> i + w }
                     if (k < 0 || k >= n) continue
                     val l = lab[k]
                     if (l >= 0) { if (owner < 0) owner = l else if (owner != l) many = true }
@@ -176,14 +194,19 @@ object PhotoPieces {
             if (owner >= 0 && !many && owner in byId) { val list = add.getOrPut(owner) { ArrayList() }; for (j in 0 until tail) list += q[j] }
         }
         if (add.isEmpty()) return seg.blobs
-        return seg.blobs.map { b ->
-            val extra = add[b.id] ?: return@map b
-            var x0 = b.minX; var y0 = b.minY; var x1 = b.maxX; var y1 = b.maxY
-            for (i in extra) { val x = i % w; val y = i / w; x0 = minOf(x0, x); y0 = minOf(y0, y); x1 = maxOf(x1, x); y1 = maxOf(y1, y) }
-            val m = Mask(x1 - x0 + 1, y1 - y0 + 1)
-            for (yy in 0 until b.bh) for (xx in 0 until b.bw) if (b.mask[xx, yy]) m[b.minX - x0 + xx, b.minY - y0 + yy] = true
-            for (i in extra) m[i % w - x0, i / w - y0] = true
-            Blob(b.id, b.count, x0, y0, x1, y1, b.color, b.hue, m, ShapeClassifier.classify(m), b.family)
+        // cada peça com ímãs: máscara nova e forma refeita, independente das outras (em paralelo, na ordem de sempre)
+        val blobs = seg.blobs
+        return Par.mapLargestFirst(blobs.size, { if (blobs[it].id in add) blobs[it].bw * blobs[it].bh else 0 }) { k ->
+            val b = blobs[k]
+            val extra = add[b.id]
+            if (extra == null) b else {
+                var x0 = b.minX; var y0 = b.minY; var x1 = b.maxX; var y1 = b.maxY
+                for (i in extra) { val x = i % w; val y = i / w; x0 = minOf(x0, x); y0 = minOf(y0, y); x1 = maxOf(x1, x); y1 = maxOf(y1, y) }
+                val m = Mask(x1 - x0 + 1, y1 - y0 + 1)
+                for (yy in 0 until b.bh) for (xx in 0 until b.bw) if (b.mask[xx, yy]) m[b.minX - x0 + xx, b.minY - y0 + yy] = true
+                for (i in extra) m[i % w - x0, i / w - y0] = true
+                Blob(b.id, b.count, x0, y0, x1, y1, b.color, b.hue, m, ShapeClassifier.classify(m), b.family)
+            }
         }
     }
 
@@ -250,7 +273,7 @@ object PhotoPieces {
         // no molde, "dentro" também exige o centro dentro do casco da de fora: caixa de peça girada (isósceles) pega a vizinha
         val localHulls = HashMap<Int, List<P2>>()
         fun inHullOf(a: Blob, o: Blob): Boolean {
-            val h = localHulls.getOrPut(o.id) { Geo2.hull(o.mask.edgePoints()) }; if (h.size < 3) return true
+            val h = localHulls.getOrPut(o.id) { maskHull(o.mask, 0, 0) }; if (h.size < 3) return true
             val p = P2(a.minX + a.bw / 2f - o.minX, a.minY + a.bh / 2f - o.minY)
             for (i in h.indices) if ((h[(i + 1) % h.size] - h[i]).cross(p - h[i]) < 0) return false
             return true
@@ -258,7 +281,7 @@ object PhotoPieces {
         // e ≥ 85% dos pixels dentro do casco da de fora: num triângulo ou L de viés a caixa tem muito espaço vazio onde
         // cabe pedaço de outra coisa
         val imgHulls = HashMap<Int, List<P2>>()
-        fun imgHull(b: Blob) = imgHulls.getOrPut(b.id) { if (b.fit == null) emptyList() else Geo2.hull(b.mask.edgePoints().map { P2(it.x + b.minX, it.y + b.minY) }) }
+        fun imgHull(b: Blob) = imgHulls.getOrPut(b.id) { if (b.fit == null) emptyList() else maskHull(b.mask, b.minX, b.minY) }
         val outerOf = blobs.associate { a ->
             a.id to blobs.filter { it !== a && inside(a, it) && (!templateShapes || inHullOf(a, it)) && (!hullInside || fractionInHull(a, imgHull(it)) >= .85f) }.minByOrNull { it.bw * it.bh }
         }
@@ -277,8 +300,9 @@ object PhotoPieces {
             // encaixe fica dentro da moldura: é a mesma região, contaria duas vezes (e duas peças juntas lidas como
             // moldura+encaixe puxavam a inclinação para 56° numa cena de 7°)
             val use = cands.filter { !isCut(it) && imgHull(it).size >= 3 && shape[it.id] != "encaixe" }
-            val est = GroundEstimate.estimate(c0, use.map { GroundEstimate.Item(imgHull(it), shape.getValue(it.id), 1f) }, inventorySizes) { h, k ->
-                measureWithTrust(h, shape.getValue(use[k].id), iouOf(use[k]))
+            val useShape = Array(use.size) { shape.getValue(use[it].id) }; val useIou = FloatArray(use.size) { iouOf(use[it]) }
+            val est = GroundEstimate.estimateArrays(c0, use.mapIndexed { k, b -> GroundEstimate.Item(imgHull(b), useShape[k], 1f) }, inventorySizes) { xs, ys, n, k, out ->
+                measureInto(xs, ys, n, useShape[k], useIou[k], out)
             }
             lastEstimate = est
             return est?.down?.takeIf { est.tiltDeg > 0f }
@@ -290,39 +314,66 @@ object PhotoPieces {
         if (templateShapes) {
             // painel/pedaço da PRÓPRIA peça dentro da caixa (mesma cor): entra na máscara dela, não é peça
             for (a in blobs) { val o = outerOf[a.id] ?: continue; if (samePiece(a, o)) drop += a.id }
-            // máscara da peça inteira (aro + painel) e forma pelo molde
-            fun classify(view: FloorView?) {
-                for (b in blobs) {
-                    if (b.id in drop) continue
-                    val m = pmask.getOrPut(b.id) { pieceMask(b, seg, byId) }
-                    val warp = view?.shapeWarp(b.minX + b.bw / 2f, b.minY + b.bh / 2f)?.first
-                    val sc = templateScore(m, warp)
-                    shape[b.id] = sc?.first ?: b.fit?.shape ?: "quadrado"; shapeIou[b.id] = sc?.second ?: 0f
-                }
+            // Quem fica dentro de outra peça vira encaixe (grande) ou sai (vidro/reflexo, pequeno); a de fora de um
+            // encaixe vira moldura e a de vários vidros, janela. Isso só depende das caixas e das cores, não do molde:
+            // decide aqui (as atribuições, na ordem de sempre) e aplica depois da forma. O molde dessas peças não é
+            // usado — só o das de fora entra na estimativa da inclinação (1ª passada).
+            val forced = LinkedHashMap<Int, String>(); val smallInner = LinkedHashSet<Int>(); val inner = HashSet<Int>()
+            for (a in blobs) {
+                if (a.id in drop) continue
+                val outer = outerOf[a.id] ?: continue
+                inner += a.id
+                // peça de outra cor dentro de outra: grande = encaixe (só entra no vão octogonal da moldura); pequena =
+                // vidro/reflexo (o molde da de fora já viu os furos)
+                if (a.bw * a.bh >= outer.bw * outer.bh * .25f) { forced[a.id] = "encaixe"; parent[a.id] = outer.id; forced[outer.id] = "moldura" }
+                else smallInner += a.id
             }
+            // vidros coloridos da janela de 4 vidros: vários pedacinhos de outra cor dentro da mesma peça
+            val dropAfter = drop + smallInner
+            blobs.filter { it.id in dropAfter }.groupBy { outerOf[it.id]?.id }
+                .forEach { (outer, inn) -> if (outer != null && outer !in dropAfter && inn.count { !samePiece(it, byId.getValue(outer)) } >= 3) forced[outer] = "janela" }
+            // máscara da peça inteira (aro + painel): de todas que ficam (o encaixe também, para o giro)
+            // e se tem furo fechado ≥ holeGate (só as vazadas concorrem no molde): não depende da perspectiva, vale
+            // para as duas passadas
+            val withMask = blobs.filter { it.id !in drop && it.id !in smallInner }
+            val framesOf = HashMap<Int, Boolean>()
+            val masks = Par.mapLargestFirst(withMask.size, { withMask[it].bw * withMask[it].bh }) {
+                val m = pieceMask(withMask[it], seg, byId); m to (withMask[it].id !in inner && holeFraction(m) >= holeGate)
+            }
+            for (i in withMask.indices) { pmask[withMask[i].id] = masks[i].first; framesOf[withMask[i].id] = masks[i].second }
+            // forma pelo molde, cada peça independente das outras (em paralelo, maiores primeiro; resultado na peça certa)
+            fun classify(view: FloorView?, todo: List<Blob>) {
+                val res = Par.mapLargestFirst(todo.size, { todo[it].bw * todo[it].bh }) { i ->
+                    val b = todo[i]
+                    val warp = view?.shapeWarp(b.minX + b.bw / 2f, b.minY + b.bh / 2f)?.first
+                    templateScore(pmask.getValue(b.id), warp, framesOf.getValue(b.id))
+                }
+                for (i in todo.indices) { val b = todo[i]; val sc = res[i]; shape[b.id] = sc?.first ?: b.fit?.shape ?: "quadrado"; shapeIou[b.id] = sc?.second ?: 0f }
+            }
+            val unused = inner + forced.keys
+            // as que precisam do molde no fim
+            val need = blobs.filter { it.id !in drop && it.id !in unused }
             view = down?.let { FloorView.of(c0, it) }
-            classify(view)
-            // sem gravidade: estima a inclinação do chão pelas peças e classifica de novo sem a perspectiva
-            if (down == null && estimateTilt && autoFloor) {
+            if (!(down == null && estimateTilt && autoFloor)) classify(view, need)
+            else {
+                // sem gravidade: estima a inclinação do chão pelas peças e classifica de novo sem a perspectiva.
+                // 1ª passada (imagem crua) só com as que a estimativa usa — as de fora (mesmo as que viram
+                // moldura/janela); pela inclinação do chão, só as inteiras na foto e com forma
                 val free = blobs.filter { it.id !in drop && outerOf[it.id] == null }
+                val first = if (shapeTilt == TiltSource.GROUND) free.filter { !isCut(it) && it.fit != null } else free
+                classify(null, first)
                 down = when (shapeTilt) {
                     TiltSource.GROUND -> estimateDown(free) { shapeIou[it.id] ?: 0f }
                     TiltSource.ISO -> FloorView.estimate(c0, free.filter { shape[it.id] in FloorView.ISOTROPIC }.map { b -> moments(pmask.getValue(b.id), b.minX, b.minY) })?.down
                 }
                 estimated = true
-                down?.let { view = FloorView.of(c0, it); classify(view) }
+                val firstIds = first.mapTo(HashSet()) { it.id }
+                // com inclinação: todas de novo sem a perspectiva; sem: as que faltaram, na imagem crua (como na 1ª passada)
+                val d = down
+                if (d != null) { view = FloorView.of(c0, d); classify(view, need) } else classify(null, need.filter { it.id !in firstIds })
             }
-            for (a in blobs) {
-                if (a.id in drop) continue
-                val outer = outerOf[a.id] ?: continue
-                // peça de outra cor dentro de outra: grande = encaixe (só entra no vão octogonal da moldura); pequena =
-                // vidro/reflexo (o molde da de fora já viu os furos)
-                if (a.bw * a.bh >= outer.bw * outer.bh * .25f) { shape[a.id] = "encaixe"; parent[a.id] = outer.id; shape[outer.id] = "moldura" }
-                else drop += a.id
-            }
-            // vidros coloridos da janela de 4 vidros: vários pedacinhos de outra cor dentro da mesma peça
-            blobs.filter { it.id in drop }.groupBy { outerOf[it.id]?.id }
-                .forEach { (outer, inner) -> if (outer != null && outer !in drop && inner.count { !samePiece(it, byId.getValue(outer)) } >= 3) shape[outer] = "janela" }
+            for ((id, s) in forced) shape[id] = s
+            drop += smallInner
         } else {
             for (b in blobs) shape[b.id] = b.fit?.shape ?: "quadrado"
             for (a in blobs) {
@@ -340,10 +391,14 @@ object PhotoPieces {
 
         val kept = blobs.filter { it.id !in drop }
         val hasInsert = parent.values.toSet()
-        val lum = Magnets.luminance(seg); val chroma = Magnets.chroma(seg)
-        for (b in kept) {
-            val s = shape.getValue(b.id)
-            if (b.id in hasInsert || b.id in parent) continue
+        val lum = Magnets.luminance(seg)
+        // contorno e ímãs de cada peça: independentes das outras (em paralelo; cada uma com o seu canal de croma, que
+        // guarda os valores já calculados e não pode ser dividido entre threads — os valores são os mesmos)
+        val outlined = kept.filter { it.id !in hasInsert && it.id !in parent }
+        val view0 = view
+        val finalShape = Par.mapLargestFirst(outlined.size, { outlined[it].bw * outlined[it].bh }) { k ->
+            val b = outlined[k]
+            val s = shape.getValue(b.id); var cur = s
             // porta/moldura/janela têm contorno QUADRADO (4 cantos, o vão fica dentro). Um entalhe só num contorno de
             // 5 cantos (canto cortado) é o L, não "porta sem soleira"; furo num contorno que não é quadrado é painel
             // que a segmentação perdeu: a forma é a do contorno cheio. Peça cortada pela borda da foto não tem o
@@ -351,33 +406,51 @@ object PhotoPieces {
             if (frameOutline && s in FRAMES && !touchesBorder(b, seg.w, seg.h) && !squareOutline(b)) {
                 if (templateShapes) {
                     // pelo molde, com o vão fechado (sem furo só concorrem as formas cheias)
-                    val warp = view?.shapeWarp(b.minX + b.bw / 2f, b.minY + b.bh / 2f)?.first
-                    templateScore(filledHoles(pmask[b.id] ?: b.mask), warp)?.first?.takeIf { it != "quadrado" }?.let { shape[b.id] = it }
+                    val warp = view0?.shapeWarp(b.minX + b.bw / 2f, b.minY + b.bh / 2f)?.first
+                    templateScore(filledHoles(pmask[b.id] ?: b.mask), warp)?.first?.takeIf { it != "quadrado" }?.let { cur = it }
                 } else {
                     val holes = b.fit?.gaps?.count { it.enclosed } ?: 0
-                    if (holes == 0) { if (s == "porta") shape[b.id] = "L" }
-                    else ShapeClassifier.classify(filledHoles(b.mask))?.shape?.takeIf { it != "quadrado" }?.let { shape[b.id] = it }
+                    if (holes == 0) { if (s == "porta") cur = "L" }
+                    else ShapeClassifier.classify(filledHoles(b.mask))?.shape?.takeIf { it != "quadrado" }?.let { cur = it }
                 }
             }
             // quadrado sem nenhuma ranhura de ímã nos lados: é o encaixe (o único quadrado sem ímã)
-            if (magnetCheck && lum != null && chroma != null && shape[b.id] == "quadrado") {
-                val q = Magnets.outline(b, 4)
-                if (q != null && Magnets.squareish(q)) {
-                    val unit = (0 until 4).map { (q[(it + 1) % 4] - q[it]).len() }.average().toFloat()
-                    if (Magnets.verdict(Magnets.contrasts(lum, chroma, q, unit)) < 0) shape[b.id] = "encaixe"
+            if (magnetCheck && lum != null && cur == "quadrado") {
+                val chroma = Magnets.chroma(seg)
+                if (chroma != null) {
+                    val q = Magnets.outline(b, 4)
+                    if (q != null && Magnets.squareish(q)) {
+                        val unit = (0 until 4).map { (q[(it + 1) % 4] - q[it]).len() }.average().toFloat()
+                        if (Magnets.verdict(Magnets.contrasts(lum, chroma, q, unit)) < 0) cur = "encaixe"
+                    }
                 }
             }
+            cur
         }
+        for (k in outlined.indices) shape[outlined[k].id] = finalShape[k]
 
         val spins = HashMap<Int, Pair<Float, Float>>(); val fits = HashMap<Int, Float>()
         fun snap(a: Float): Float { val q = (Math.PI / 2).toFloat(); val r = Math.round(a / q) * q; return if (abs(a - r) < .14f) r else a }
-        for (b in kept) {
-            val f = b.fit ?: continue
-            // molde exato do catálogo: frente (v para cima → giro = -θ) e cima (v para baixo → giro = θ)
-            val m = pmask[b.id] ?: b.mask
-            val (thUp, iou) = TemplateFit.fit(m, f.obb, shape.getValue(b.id), vUp = true, corners = f.corners)
-            val (thDown, _) = TemplateFit.fit(m, f.obb, shape.getValue(b.id), vUp = false, corners = f.corners)
-            spins[b.id] = snap(-thUp) to snap(thDown); fits[b.id] = iou
+        // molde exato do catálogo: frente (v para cima → giro = -θ) e cima (v para baixo → giro = θ); cada peça e cada
+        // lado independentes (em paralelo). O encaixe segue o giro da moldura onde está: o giro "de cima" dele só seria
+        // trocado pelo da moldura (fica de fora quando ninguém o lê); o IoU dele (de frente) vale para a medida
+        val withFit = kept.filter { it.fit != null }
+        val keptIds = kept.mapTo(HashSet()) { it.id }
+        fun followsFrame(b: Blob): Boolean {
+            val fr = parent[b.id] ?: return false
+            return b.id !in hasInsert && fr in keptIds && byId[fr]?.fit != null
+        }
+        val tasks = ArrayList<Pair<Blob, Boolean>>()
+        for (b in withFit) { tasks += b to true; if (!followsFrame(b)) tasks += b to false }
+        val fitRes = Par.mapLargestFirst(tasks.size, { val b = tasks[it].first; (b.bw + 8) * (b.bh + 8) * (if (shape.getValue(b.id) in SQUARE_FIT) 4 else 8 + 4 * b.fit!!.corners.size) }) { i ->
+            val (b, up) = tasks[i]; val f = b.fit!!
+            TemplateFit.fit(pmask[b.id] ?: b.mask, f.obb, shape.getValue(b.id), vUp = up, corners = f.corners)
+        }
+        val upOf = HashMap<Int, Pair<Float, Float>>(); val downOf = HashMap<Int, Float>()
+        for (i in tasks.indices) { val (b, up) = tasks[i]; if (up) upOf[b.id] = fitRes[i] else downOf[b.id] = fitRes[i].first }
+        for (b in withFit) {
+            val (thUp, iou) = upOf.getValue(b.id)
+            spins[b.id] = snap(-thUp) to (downOf[b.id]?.let { snap(it) } ?: 0f); fits[b.id] = iou
         }
         // encaixe segue o giro da moldura onde está
         for ((ins, frame) in parent) spins[frame]?.let { spins[ins] = it }
@@ -447,7 +520,7 @@ object PhotoPieces {
      */
     internal fun pieceMask(b: Blob, seg: Segmentation, byId: Map<Int, Blob>): Mask {
         val fg = seg.fg ?: return b.mask; val A = seg.A ?: return b.mask; val B = seg.B ?: return b.mask
-        val hull = Geo2.hull(b.mask.edgePoints()); if (hull.size < 3) return b.mask
+        val hull = maskHull(b.mask, 0, 0); if (hull.size < 3) return b.mask
         fun inHull(x: Float, y: Float): Boolean {
             for (i in hull.indices) if ((hull[(i + 1) % hull.size] - hull[i]).cross(P2(x, y) - hull[i]) < 0) return false
             return true
@@ -481,6 +554,29 @@ object PhotoPieces {
     }
 
     private val HUE_COS = kotlin.math.cos(Math.toRadians(28.0)).toFloat()
+    /** Formas que o TemplateFit testa só em 4 giros (estimativa do trabalho de cada giro, para a ordem das tarefas). */
+    private val SQUARE_FIT = setOf("quadrado", "moldura", "janela", "encaixe")
+
+    /**
+     * O mesmo que Geo2.hull(m.edgePoints() deslocados de ([ox], [oy])), sem a lista de pontos de borda: o casco da
+     * união dos pixels é o dos 4 cantos dos pixels das pontas de cada linha (os outros pontos de borda ficam dentro), e
+     * com coordenadas inteiras pequenas as contas em float são exatas — mesmo casco, mesmos vértices na mesma ordem
+     * (a cadeia monótona começa no menor (x, y), que está entre esses cantos).
+     */
+    internal fun maskHull(m: Mask, ox: Int, oy: Int): List<P2> {
+        val xs = FloatArray(4 * m.h); val ys = FloatArray(4 * m.h); var n = 0
+        for (y in 0 until m.h) {
+            val row = y * m.w; var x0 = -1; var x1 = -1
+            for (x in 0 until m.w) if (m.bits[row + x]) { if (x0 < 0) x0 = x; x1 = x }
+            if (x0 < 0) continue
+            val l = (x0 + ox).toFloat(); val r = (x1 + 1 + ox).toFloat(); val t = (y + oy).toFloat(); val b = (y + 1 + oy).toFloat()
+            xs[n] = l; ys[n++] = t; xs[n] = l; ys[n++] = b; xs[n] = r; ys[n++] = t; xs[n] = r; ys[n++] = b
+        }
+        if (n == 0) return emptyList()
+        val hx = FloatArray(n); val hy = FloatArray(n)
+        val k = HullOps.hull(xs, ys, n, hx, hy, LongArray(n))
+        return List(k) { P2(hx[it], hy[it]) }
+    }
 
     /** Centro e covariância (cx, cy, cxx, cxy, cyy, em pixels da imagem) da silhueta cheia (peça + furos fechados). */
     internal fun moments(m: Mask, x0: Int, y0: Int): FloatArray {
@@ -508,8 +604,10 @@ object PhotoPieces {
     internal fun templateShape(m: Mask, warp: FloatArray? = null): String? = templateScore(m, warp)?.first
 
     /** [templateShape] e o IoU do molde escolhido (0 quando a forma veio da regra da faixa comprida). */
-    internal fun templateScore(m: Mask, warp: FloatArray? = null): Pair<String, Float>? {
-        val frames = holeFraction(m) >= holeGate
+    internal fun templateScore(m: Mask, warp: FloatArray? = null): Pair<String, Float>? = templateScore(m, warp, holeFraction(m) >= holeGate)
+
+    /** [templateScore] com [frames] (furo ≥ [holeGate]: só as vazadas concorrem) já calculado para [m]. */
+    internal fun templateScore(m: Mask, warp: FloatArray?, frames: Boolean): Pair<String, Float>? {
         val scores = ShapeMatch.match(m, if (frames) FRAMES else ShapeMatch.LOOSE, warp)
         // faixa comprida (≥ 3:1) que não fecha com molde nenhum só pode ser o E: nenhuma outra peça passa de 2:1, e no
         // E os dentes finos ficam quase todos cobertos pelos ímãs (escuros, fora da região) e sobra a espinha. (Retângulo
@@ -557,7 +655,7 @@ object PhotoPieces {
         for (b in blobs) {
             if (b.count < 60) continue
             // vãos dentro do casco convexo: furos fechados e entalhes (o aro partido no ímã abre o painel para fora)
-            val hull = Geo2.hull(b.mask.edgePoints())
+            val hull = maskHull(b.mask, 0, 0)
             val inHull = Mask(b.mask.w, b.mask.h)
             for (y in 0 until b.mask.h) for (x in 0 until b.mask.w) {
                 val p = P2(x + .5f, y + .5f)
@@ -680,7 +778,7 @@ object PhotoPieces {
     private fun squareOutline(b: Blob): Boolean {
         val q = Magnets.outline(b, 4) ?: return false
         if (!Magnets.squareish(q)) return false
-        val hull = Geo2.hull(b.mask.edgePoints())
+        val hull = maskHull(b.mask, 0, 0)
         return Geo2.area(q) >= Geo2.area(hull) * .75f
     }
 
@@ -696,5 +794,78 @@ object PhotoPieces {
             if (!border) for (k in c.bits.indices) if (c.bits[k]) out.bits[k] = true
         }
         return out
+    }
+}
+
+/**
+ * Laço paralelo para trabalho independente por índice (forma de cada peça pelo molde, giro de cada peça, custo de
+ * cada hipótese de inclinação): cada f(i) só lê dados compartilhados e devolve o seu resultado, que vai para a posição
+ * i. A saída não depende da ordem nem de quantas threads rodaram: é a mesma do laço sequencial.
+ * A thread que chama também trabalha e só espera os índices que outras threads já pegaram (sem deadlock em chamada
+ * aninhada nem com o pool ocupado).
+ */
+internal object Par {
+    /** false = tudo sequencial na thread que chama. */
+    @JvmField @Volatile var enabled = true
+    /**
+     * Threads ajudantes (além da que chama). No celular: núcleos − 2, até 3 — a câmera, o preview e a tela também
+     * precisam de núcleo, e em big.LITTLE os núcleos lentos alongam o caminho crítico. No PC (testes): núcleos − 1, até 7.
+     * O resultado não depende do número de threads (golden em paralelo e sequencial).
+     */
+    private val helpers = Runtime.getRuntime().availableProcessors().let { n ->
+        if (System.getProperty("java.vendor").orEmpty().contains("Android", ignoreCase = true)) (n - 2).coerceIn(0, 3) else (n - 1).coerceIn(0, 7)
+    }
+    private val pool: java.util.concurrent.ExecutorService by lazy {
+        // prioridade fixa: sem isso as ajudantes herdam a da primeira thread que chamou (às vezes de fundo, baixa)
+        java.util.concurrent.Executors.newFixedThreadPool(maxOf(1, helpers)) { r -> Thread(r, "brascan-par").apply { isDaemon = true; priority = Thread.NORM_PRIORITY } }
+    }
+
+    /**
+     * f(i) para cada i, cada um pego por uma thread na ordem 0, 1, 2… (sequencial: nessa ordem). Para quem precisa
+     * de algo além de "resultado na posição i" (poda com o melhor já achado): o que f faz com os dados compartilhados
+     * tem que ser seguro entre threads e não pode mudar o resultado final conforme a ordem.
+     */
+    fun forEach(n: Int, f: (Int) -> Unit) = run(n, f)
+
+    private fun run(n: Int, f: (Int) -> Unit) {
+        if (n <= 0) return
+        if (n == 1 || !enabled || helpers == 0) { for (i in 0 until n) f(i); return }
+        val next = java.util.concurrent.atomic.AtomicInteger()
+        val left = java.util.concurrent.CountDownLatch(n)
+        val err = java.util.concurrent.atomic.AtomicReference<Throwable?>()
+        val work = Runnable {
+            while (true) {
+                val i = next.getAndIncrement(); if (i >= n) break
+                try { f(i) } catch (t: Throwable) { err.compareAndSet(null, t) } finally { left.countDown() }
+            }
+        }
+        repeat(minOf(helpers, n - 1)) { pool.execute(work) }
+        work.run()
+        // espera sem largar no meio (os ajudantes ainda escrevem nos resultados); a interrupção fica marcada
+        var interrupted = false
+        while (true) { try { left.await(); break } catch (e: InterruptedException) { interrupted = true } }
+        if (interrupted) Thread.currentThread().interrupt()
+        err.get()?.let { throw it }
+    }
+
+    fun <T> map(n: Int, f: (Int) -> T): List<T> {
+        val out = arrayOfNulls<Any?>(n)
+        run(n) { out[it] = f(it) }
+        @Suppress("UNCHECKED_CAST") return out.asList() as List<T>
+    }
+
+    fun mapFloat(n: Int, f: (Int) -> Float): FloatArray { val out = FloatArray(n); run(n) { out[it] = f(it) }; return out }
+
+    /**
+     * [map] com as tarefas começando pelas de maior [cost] (estimativa do trabalho): a mais pesada não fica para o
+     * fim com as outras threads paradas. O resultado continua na posição i.
+     */
+    fun <T> mapLargestFirst(n: Int, cost: (Int) -> Int, f: (Int) -> T): List<T> {
+        if (n <= 1 || !enabled || helpers == 0) return map(n, f)
+        val c = IntArray(n) { cost(it) }
+        val ord = (0 until n).sortedByDescending { c[it] }
+        val out = arrayOfNulls<Any?>(n)
+        run(n) { val i = ord[it]; out[i] = f(i) }
+        @Suppress("UNCHECKED_CAST") return out.asList() as List<T>
     }
 }

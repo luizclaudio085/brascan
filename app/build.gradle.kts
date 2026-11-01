@@ -62,5 +62,10 @@ tasks.withType<Test>().configureEach {
     // classes de teste divididas entre JVMs (o CI do GitHub tem 4 núcleos)
     maxParallelForks = (Runtime.getRuntime().availableProcessors() / 2).coerceAtLeast(1)
     // sondas (*Probe) só medem e imprimem números, não são regressão: no CI ficam de fora (publicação mais rápida)
-    if (System.getenv("CI") == "true") exclude("**/*Probe*")
+    if (System.getenv("CI") == "true") {
+        exclude("**/*Probe*")
+        // goldens do detector (saída igual bit a bit ao código anterior): ~75 s de CPU; rodam aqui antes de publicar
+        // qualquer mudança em vision/ (./gradlew :app:testDebugUnitTest --tests '*GoldenTest*'), não a cada publicação
+        exclude("**/*GoldenTest*")
+    }
 }

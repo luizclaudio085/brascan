@@ -53,6 +53,13 @@ internal class Reg(val cnt: Int, val da: Double, val db: Double, val l: Double, 
  *    parecidos, borda em comum — e só então aplica o tamanho mínimo (peça pequena era só pedaços abaixo dele);
  * 6. peça pequena (abaixo do mínimo antigo) entra se tiver a cor das peças grandes da foto;
  * 7. marca os ímãs (manchas escuras coladas numa peça) para o detector de fotos juntar à peça.
+ *
+ * Velocidade (a mesma saída, bit a bit, da conta direta; golden em DetectorGoldenTest): Lab por tabelas por canal e
+ * raiz cúbica por polinômio (Math.cbrt só perto do meio entre dois floats; as 2^24 cores conferidas em
+ * SegmenterLabTest), numa passada só com o primeiro plano; fundo pelas amostras e mediana por seleção pela raiz;
+ * limiares de distância comparados ao quadrado (corte exato, achado uma vez por busca binária na própria sqrt);
+ * fechamento morfológico em bits (64 pixels por Long); crescimento, junção e ímãs só pelos pixels marcados (bits /
+ * lista), vizinhos sem alocar arrays e buffers do quadro reaproveitados.
  */
 object Segmenter {
     const val BINS = 12
@@ -92,16 +99,118 @@ object Segmenter {
     }
 
     private val lin = FloatArray(256) { val c = it / 255f; if (c <= .04045f) c / 12.92f else ((c + .055f) / 1.055f).pow(2.4f) }
-    private fun f(t: Float) = if (t > .008856f) cbrt(t) else 7.787f * t + 16f / 116f
 
-    /** sRGB → CIE Lab (D65). */
+    /**
+     * sRGB → CIE Lab (D65): x = f((0,4124·r + 0,3576·g + 0,1805·b) / 0,95047), y = f(0,2126·r + 0,7152·g + 0,0722·b),
+     * z = f((0,0193·r + 0,1192·g + 0,9505·b) / 1,08883) com r, g, b lineares e f(t) = ∛t (t > 0,008856) ou
+     * 7,787·t + 16/116; L* = 116·y − 16, a* = 500·(x − y), b* = 200·(y − z), tudo em float. Calculado por tabelas e
+     * pela raiz cúbica rápida ([cbrtF]): os MESMOS floats da conta direta com kotlin.math.cbrt nas 2^24 cores
+     * (SegmenterLabTest).
+     */
     fun lab(c: Int, out: FloatArray) {
-        val r = lin[c shr 16 and 255]; val g = lin[c shr 8 and 255]; val b = lin[c and 255]
-        val x = f((.4124f * r + .3576f * g + .1805f * b) / .95047f)
-        val y = f(.2126f * r + .7152f * g + .0722f * b)
-        val z = f((.0193f * r + .1192f * g + .9505f * b) / 1.08883f)
+        val r = c shr 16 and 255; val g = c shr 8 and 255; val b = c and 255
+        val x = fLab((XR[r] + XG[g] + XB[b]) / .95047f)
+        val y = fLab(YR[r] + YG[g] + YB[b])
+        val z = fLab((ZR[r] + ZG[g] + ZB[b]) / 1.08883f)
         out[0] = 116f * y - 16f; out[1] = 500f * (x - y); out[2] = 200f * (y - z)
     }
+
+    // produto de cada canal linear pelo coeficiente da matriz: o mesmo float de 0,4124f * lin[r] etc., somado na mesma ordem
+    private val XR = FloatArray(256) { .4124f * lin[it] }; private val XG = FloatArray(256) { .3576f * lin[it] }; private val XB = FloatArray(256) { .1805f * lin[it] }
+    private val YR = FloatArray(256) { .2126f * lin[it] }; private val YG = FloatArray(256) { .7152f * lin[it] }; private val YB = FloatArray(256) { .0722f * lin[it] }
+    private val ZR = FloatArray(256) { .0193f * lin[it] }; private val ZG = FloatArray(256) { .1192f * lin[it] }; private val ZB = FloatArray(256) { .9505f * lin[it] }
+    /**
+     * ∛ no meio de cada uma das 512 faixas c de m ∈ [1, 2) e os termos de Taylor: ∛(c + d) = a0 + d·(a1 + d·(a2 + d·a3)),
+     * com |d| ≤ 1/1024 o erro relativo é < 2^-44,5 (próximo termo: 10/243 · (d/c)^4).
+     */
+    private val CB_POLY = DoubleArray(512 * 4).also { t ->
+        for (k in 0 until 512) {
+            val c = 1.0 + (k + .5) / 512; val a0 = Math.cbrt(c)
+            t[4 * k] = a0; t[4 * k + 1] = a0 / (3 * c); t[4 * k + 2] = -a0 / (9 * c * c); t[4 * k + 3] = 5 * a0 / (81 * c * c * c)
+        }
+    }
+    /** ∛(2^e) pelo expoente com viés do float (1..254). */
+    private val CB_EXP = DoubleArray(256) { if (it in 1..254) Math.cbrt(Math.scalb(1.0, it - 127)) else 0.0 }
+    private const val TWO_M23 = 1.0 / (1 shl 23)
+
+    /**
+     * ∛t, o MESMO float que kotlin.math.cbrt(t) (= Math.cbrt em double arredondado para float), sem divisão: polinômio
+     * da faixa × ∛(2^e), erro relativo < 2^-44,4 (≤ ~370 ulps do double; Math.cbrt erra < 1 ulp). O float é decidido
+     * pelos 29 bits de baixo do double: a ≥ 2^13 ulps do meio entre dois floats (bits = 2^28), o Math.cbrt arredonda
+     * para o mesmo float; mais perto disso (1 em 2^15 chamadas), usa o próprio Math.cbrt.
+     */
+    private fun cbrtF(t: Float): Float {
+        val bits = java.lang.Float.floatToRawIntBits(t)
+        if (bits < 0x00800000 || bits >= 0x7F800000) return cbrt(t) // ≤ 0, subnormal, infinito, NaN
+        val mant = bits and 0x7FFFFF
+        val j = (mant ushr 14) shl 2
+        val d = ((mant and 0x3FFF) - 0x2000) * TWO_M23 // m − c, exato
+        val y = (CB_POLY[j] + d * (CB_POLY[j + 1] + d * (CB_POLY[j + 2] + d * CB_POLY[j + 3]))) * CB_EXP[bits ushr 23]
+        val low = java.lang.Double.doubleToRawLongBits(y) and 0x1FFFFFFFL
+        return if (abs(low - 0x10000000L) > 0x2000L) y.toFloat() else cbrt(t)
+    }
+
+    private fun fLab(t: Float) = if (t > .008856f) cbrtF(t) else 7.787f * t + 16f / 116f
+
+    /** [lab] da cor [c] em L[i], A[i], B[i] (a mesma conta). */
+    private fun labInto(c: Int, L: FloatArray, A: FloatArray, B: FloatArray, i: Int) {
+        val r = c shr 16 and 255; val g = c shr 8 and 255; val b = c and 255
+        val x = fLab((XR[r] + XG[g] + XB[b]) / .95047f)
+        val y = fLab(YR[r] + YG[g] + YB[b])
+        val z = fLab((ZR[r] + ZG[g] + ZB[b]) / 1.08883f)
+        L[i] = 116f * y - 16f; A[i] = 500f * (x - y); B[i] = 200f * (y - z)
+    }
+
+    /** [lab] de px[0 until n] em L, A, B, pelo caminho da segmentação (o teste das 2^24 cores confere este também). */
+    internal fun labPixels(px: IntArray, n: Int, L: FloatArray, A: FloatArray, B: FloatArray) { for (i in 0 until n) labInto(px[i], L, A, B, i) }
+
+    /**
+     * Maior float s ≥ 0 com [pred] verdadeiro, para [pred] que vale num começo de [0, ∞] e depois não (−1 se nem em 0;
+     * +∞ se até no infinito). Com pred = "sqrt(s) ≤ t" vira um corte exato: sqrt(s) ≤ t ⇔ s ≤ corte (sqrt é monótona).
+     */
+    private inline fun lastWhere(pred: (Float) -> Boolean): Float {
+        if (!pred(0f)) return -1f
+        if (pred(Float.POSITIVE_INFINITY)) return Float.POSITIVE_INFINITY
+        var lo = 0; var hi = 0x7F800000
+        while (hi - lo > 1) { val mid = (lo + hi) ushr 1; if (pred(java.lang.Float.intBitsToFloat(mid))) lo = mid else hi = mid }
+        return java.lang.Float.intBitsToFloat(lo)
+    }
+
+    /**
+     * k-ésimo menor de v[0 until size] na ordem de Float.compareTo (= sorted()[k]), sem ordenar: seleção pela raiz em
+     * 3 passadas de histograma (11 + 11 + 10 bits) de uma chave sem sinal com a mesma ordem.
+     */
+    internal fun select(v: FloatArray, size: Int, k: Int): Float {
+        // chave: positivos (+0, +∞, NaN canônico) com o bit de cima ligado; negativos invertidos (−0 logo abaixo de +0)
+        val a = IntArray(size) { val b = java.lang.Float.floatToIntBits(v[it]); if (b < 0) b.inv() else b or Int.MIN_VALUE }
+        val hist = IntArray(2048)
+        var prefix = 0; var prefixMask = 0; var rank = k
+        for (pass in 0 until 3) {
+            val shift = if (pass == 0) 21 else if (pass == 1) 10 else 0
+            val m = if (pass == 2) 1023 else 2047
+            java.util.Arrays.fill(hist, 0)
+            for (j in 0 until size) { val u = a[j]; if ((u and prefixMask) == prefix) hist[(u ushr shift) and m]++ }
+            var bin = 0
+            while (rank >= hist[bin]) { rank -= hist[bin]; bin++ }
+            prefix = prefix or (bin shl shift); prefixMask = prefixMask or (m shl shift)
+        }
+        return java.lang.Float.intBitsToFloat(if (prefix < 0) prefix and Int.MAX_VALUE else prefix.inv())
+    }
+
+    /** Buffers do quadro que não saem do segment(): um só, reaproveitado (chamada concorrente usa buffers próprios). */
+    private class Scratch {
+        var raw = IntArray(0); var q = IntArray(0); var qx = IntArray(0); var darkIdx = IntArray(0)
+        var bridge = BooleanArray(0); var dark = BooleanArray(0); var seen = BooleanArray(0)
+        /** Máscaras em bits: [b0] = primeiro plano; [b1], [b2] = o fechamento. */
+        var b0 = LongArray(0); var b1 = LongArray(0); var b2 = LongArray(0)
+        fun ensure(n: Int, words: Int) {
+            if (raw.size < n) { raw = IntArray(n); q = IntArray(n); qx = IntArray(n); darkIdx = IntArray(n); bridge = BooleanArray(n); dark = BooleanArray(n); seen = BooleanArray(n) }
+            if (b0.size < words) { b0 = LongArray(words); b1 = LongArray(words); b2 = LongArray(words) }
+        }
+    }
+    private const val SHARED_MAX_PX = 1_000_000L
+    private val shared = Scratch()
+    private val sharedBusy = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /**
      * [minFrac]: região com pelo menos essa fração do quadro (em pixels de cor) entra.
@@ -111,99 +220,52 @@ object Segmenter {
      */
     fun segment(px: IntArray, w: Int, h: Int, minFrac: Float = .002f, maxFrac: Float = .35f, maxBlobs: Int = 80, fgThreshold: Float = 13f,
                 loose: Boolean = false, smallFrac: Float = minFrac * .4f): Segmentation {
-        val n = w * h
-        val L = FloatArray(n); val A = FloatArray(n); val B = FloatArray(n); val t = FloatArray(3)
-        for (i in 0 until n) { lab(px[i], t); L[i] = t[0]; A[i] = t[1]; B[i] = t[2] }
-
-        // fundo: mediana de a/b do ANEL externo do quadro (a construção fica no meio e pode encher o quadro);
-        // se o anel for colorido (toalha, parede), usa a mediana do quadro inteiro
-        val step = max(1, n / 20000)
-        val ring = ArrayList<Int>(n / step / 2)
-        val mx = w / 10; val my = h / 10
-        for (i in 0 until n step step) { val x = i % w; val y = i / w; if (x < mx || x >= w - mx || y < my || y >= h - my) ring += i }
-        var bgA: Float; var bgB: Float; val bgL: Float
-        run {
-            val ra = ring.map { A[it] }.sorted(); val rb = ring.map { B[it] }.sorted()
-            bgA = ra[ra.size / 2]; bgB = rb[rb.size / 2]
-            bgL = ring.map { L[it] }.sorted()[ring.size / 2]
-            if (!ringBackground || sqrt(bgA * bgA + bgB * bgB) > 15f) {
-                val sa = (0 until n step step).map { A[it] }.sorted(); val sb = (0 until n step step).map { B[it] }.sorted()
-                bgA = sa[sa.size / 2]; bgB = sb[sb.size / 2]
-            }
+        // quadro grande (foto em resolução cheia) usa buffers descartáveis: o compartilhado fica preso enquanto o app vive,
+        // então só serve quadros de até SHARED_MAX_PX (cobre a câmera e a foto de 640 px)
+        val sc = if (w.toLong() * h <= SHARED_MAX_PX && sharedBusy.compareAndSet(false, true)) shared else Scratch()
+        try {
+            return segment(px, w, h, minFrac, maxFrac, maxBlobs, fgThreshold, loose, smallFrac, sc)
+        } finally {
+            if (sc === shared) sharedBusy.set(false)
         }
-        // matiz (direção de a*, b*) e croma (saturação) de cada pixel
-        val C = FloatArray(n); val Hc = FloatArray(n); val Hs = FloatArray(n)
-        for (i in 0 until n) { val c = sqrt(A[i] * A[i] + B[i] * B[i]); C[i] = c; if (c > 1e-3f) { Hc[i] = A[i] / c; Hs[i] = B[i] / c } }
-        val fg = BooleanArray(n) { val da = A[it] - bgA; val db = B[it] - bgB; sqrt(da * da + db * db) > fgThreshold && L[it] > 12f }
+    }
+
+    private fun segment(px: IntArray, w: Int, h: Int, minFrac: Float, maxFrac: Float, maxBlobs: Int, fgThreshold: Float,
+                        loose: Boolean, smallFrac: Float, sc: Scratch): Segmentation {
+        val n = w * h
+        val words = (w + 63) ushr 6 // linha da máscara em bits
+        sc.ensure(n, words * h)
+        // fundo pelas amostras (Lab só delas); depois uma passada só: Lab, primeiro plano e candidatos a ímã de cada pixel
+        val step = max(1, n / 20000)
+        val samples = (n + step - 1) / step
+        val sl = FloatArray(samples); val sa = FloatArray(samples); val sb = FloatArray(samples)
+        val bg = background(px, w, h, step, sl, sa, sb)
+        val bgL = bg[0]; val bgA = bg[1]; val bgB = bg[2]
+        val L = FloatArray(n); val A = FloatArray(n); val B = FloatArray(n)
+        // primeiro plano: pixels cuja cor (a*, b*) se afasta do fundo e não são pretos
+        val fg = BooleanArray(n)
+        val marked = loose && markMagnets
+        // candidatos a ímã (L < magnetDarkL × L do fundo, sqrt(da² + db²) < 22 ⇔ da² + db² ≤ corte) na mesma passada
+        val darkCount = labForeground(px, L, A, B, step, sl, sa, sb, bgA, bgB, lastWhere { !(sqrt(it) > fgThreshold) }, fg, sc.b0, w, h, words,
+            if (marked) sc.dark else null, sc.darkIdx, magnetDarkL * bgL, lastWhere { sqrt(it) < 22f })
+        // matiz (direção de a*, b*) e croma (saturação) de cada pixel: só o crescimento pelo matiz (hueGrowing) usa
+        val C: FloatArray?; val Hc: FloatArray?; val Hs: FloatArray?
+        if (hueGrowing) {
+            C = FloatArray(n); Hc = FloatArray(n); Hs = FloatArray(n)
+            for (i in 0 until n) { val c = sqrt(A[i] * A[i] + B[i] * B[i]); C[i] = c; if (c > 1e-3f) { Hc[i] = A[i] / c; Hs[i] = B[i] / c } }
+        } else { C = null; Hc = null; Hs = null }
         // ímãs: mancha bem mais escura que o fundo (a sombra no chão escurece bem menos) e quase sem cor, do tamanho de um
         // ímã, colada na peça. É peça, não cor da peça. Nos dentes do E os ímãs cobrem o dente inteiro: sem eles o dente some
         // e o E vira L/porta/retângulo. Mancha escura grande (objeto escuro, fundo) fica fora. Só marca: quem junta à peça
         // é o detector de fotos (PhotoPieces), com peças soltas; no scanner a emenda escura entre peças encostadas não é ímã.
-        val magnet = BooleanArray(n)
-        val marked = loose && markMagnets
-        if (marked) {
-            val dark = BooleanArray(n) { val da = A[it] - bgA; val db = B[it] - bgB; L[it] < magnetDarkL * bgL && sqrt(da * da + db * db) < 22f }
-            val seen = BooleanArray(n); val qq = IntArray(n); val maxCells = max(8, (n * magnetMaxFrac).toInt())
-            for (s0 in 0 until n) {
-                if (!dark[s0] || seen[s0]) continue
-                var head = 0; var tail = 0; qq[tail++] = s0; seen[s0] = true; var touches = false
-                while (head < tail) {
-                    val i = qq[head++]; val x = i % w
-                    for (k in intArrayOf(if (x > 0) i - 1 else -1, if (x < w - 1) i + 1 else -1, i - w, i + w)) {
-                        if (k < 0 || k >= n) continue
-                        if (dark[k]) { if (!seen[k]) { seen[k] = true; qq[tail++] = k } } else if (fg[k]) touches = true
-                    }
-                }
-                if (touches && tail <= maxCells) for (j in 0 until tail) magnet[qq[j]] = true
-            }
-        }
-
+        val magnet = if (marked) BooleanArray(n).also { if (darkCount > 0) findMagnets(it, fg, darkCount, w, n, sc) } else null
         // fechamento (raio ~0,5% da largura): pontes sobre ímãs, reflexos e o sulco escuro entre aro e painel;
         // esses pixels "ponte" não entram na média de cor. A emenda entre duas peças encostadas também vira ponte —
         // é a divisão por emenda (seamSplit) que separa depois, olhando os pixels escuros que não são primeiro plano.
-        val r = max(1, w / 200)
-        val closed = Mask(w, h, fg.copyOf()).let { m -> var x = m; repeat(r) { x = x.dilate() }; repeat(r) { x = x.erode() }; x }
-        val bridge = BooleanArray(n) { closed.bits[it] && !fg[it] }
-
-        val label = IntArray(n) { -1 }; val raw = IntArray(n) { -1 }; val q = IntArray(n)
-        val blobs = ArrayList<Blob>()
-        val regs = ArrayList<Reg>()
-        var region = 0
-        for (s in 0 until n) {
-            if (raw[s] >= 0 || !fg[s]) continue
-            var head = 0; var tail = 0; q[tail++] = s; raw[s] = region
-            // matiz médio da região = soma dos vetores (cos, sin) pesada pelo croma (média circular) + média de a/b/L
-            var sumHc = (Hc[s] * C[s]).toDouble(); var sumHs = (Hs[s] * C[s]).toDouble()
-            var sumL = L[s].toDouble(); var sumA = A[s].toDouble(); var sumB = B[s].toDouble(); var cnt = 1
-            var x0 = w; var y0 = h; var x1 = 0; var y1 = 0
-            while (head < tail) {
-                val i = q[head++]; val x = i % w; val y = i / w
-                x0 = min(x0, x); x1 = max(x1, x); y0 = min(y0, y); y1 = max(y1, y)
-                val ml = sqrt(sumHc * sumHc + sumHs * sumHs).coerceAtLeast(1e-9); val mcx = (sumHc / ml).toFloat(); val mcy = (sumHs / ml).toFloat()
-                val mA = (sumA / cnt).toFloat(); val mB = (sumB / cnt).toFloat(); val mL = (sumL / cnt).toFloat()
-                for (k in intArrayOf(if (x > 0) i - 1 else -1, if (x < w - 1) i + 1 else -1, i - w, i + w)) {
-                    if (k < 0 || k >= n || raw[k] >= 0) continue
-                    if (fg[k]) {
-                        // Entra se (a) tem o mesmo MATIZ da região (22°; 40° quando pouco saturado) e do vizinho (18°):
-                        // aro, painel translúcido e vincos da mesma peça; OU (b) está perto da média de a/b/L da região
-                        // e do vizinho (degradê suave, como nas fotos reais em que o painel puxa para a cor do fundo).
-                        // A peça do lado, de outra cor, falha nas duas.
-                        // Pelo matiz só de um pixel saturado da própria região para outro saturado vizinho (aro → painel):
-                        // vindo por uma ponte (ímã/sulco escuro) a cor tem que bater de verdade, senão a região atravessa
-                        // o ímã da peça do lado e entra no painel dela (laranja × rosa nas fotos reais).
-                        val byHue = hueGrowing && fg[i] && C[i] > 18f && C[k] > 14f && Hc[k] * mcx + Hs[k] * mcy >= HUE_22 && !(C[k] > 18f && Hc[k] * Hc[i] + Hs[k] * Hs[i] < HUE_18)
-                        val da = A[k] - mA; val db = B[k] - mB
-                        val byMean = sqrt(da * da + db * db) <= 16f && abs(L[k] - mL) <= 38f &&
-                            !(fg[i] && run { val ea = A[k] - A[i]; val eb = B[k] - B[i]; sqrt(ea * ea + eb * eb) > 7f })
-                        if (!byHue && !byMean) continue
-                        sumHc += Hc[k] * C[k]; sumHs += Hs[k] * C[k]; sumL += L[k]; sumA += A[k]; sumB += B[k]; cnt++
-                    } else if (!bridge[k] || !fg[i] && !bridge[i]) continue
-                    raw[k] = region; q[tail++] = k
-                }
-            }
-            region++
-            regs += Reg(cnt, sumA / cnt - bgA, sumB / cnt - bgB, sumL / cnt, x0, y0, x1, y1)
-        }
+        val bridge = sc.bridge
+        val closed = closing(bridge, max(1, w / 200), w, h, words, sc)
+        val raw = sc.raw
+        val regs = grow(L, A, B, fg, bridge, raw, sc.q, sc.qx, sc.b0, w, h, words, bgA, bgB, C, Hc, Hs)
         // Pedaços da mesma peça: o crescimento por cor separa aro (mais claro), painel (translúcido), vincos e a borda
         // borrada quando o degrau de cor entre vizinhos passa de 7 — numa peça pequena tudo isso tem 1-3 px e nenhum
         // pedaço sozinho chega ao tamanho mínimo (a peça sumia); num quadrado médio os vincos em X partiam o painel em 4
@@ -214,100 +276,346 @@ object Segmenter {
         // grandes das fotos reais cresciam e a escala de tamanho (calibrada sem ela) mudava.
         val nr = regs.size
         val root = IntArray(nr) { it }
-        fun find(x: Int): Int { var a = x; while (root[a] != a) { root[a] = root[root[a]]; a = root[a] }; return a }
-        if (loose && joinParts && nr > 1) {
-            val per = IntArray(nr); val contact = HashMap<Long, Int>()
-            for (i in 0 until n) {
-                val a = raw[i]; if (a < 0) continue
-                val x = i % w
-                for (k in intArrayOf(if (x > 0) i - 1 else -1, if (x < w - 1) i + 1 else -1, i - w, i + w)) {
-                    val b = if (k < 0 || k >= n) -1 else raw[k]
-                    if (b == a) continue
-                    per[a]++
-                    if (b > a) contact.merge(a.toLong() * nr + b, 1, Int::plus)
+        if (loose && joinParts && nr > 1) joinPieces(raw, regs, root, sc.b0, closed, w, h, words)
+        val label = IntArray(n); java.util.Arrays.fill(label, -1)
+        val blobs = ArrayList<Blob>()
+        groupBlobs(blobs, label, raw, regs, root, px, L, fg, w, h, minFrac, maxFrac, loose, smallFrac)
+        val created = blobs.size
+        mergeOverlapping(blobs, label, w)
+        // entalhe que é outra peça na frente não é forma: reclassifica sabendo onde estão as outras peças
+        if (occlusionReclassify) for (i in blobs.indices) {
+            val b = blobs[i]; val f = b.fit ?: continue
+            if (f.gaps.isEmpty()) continue
+            val other = Mask(b.bw, b.bh); var outside = false
+            for (yy in 0 until b.bh) for (xx in 0 until b.bw) { val l = label[(b.minY + yy) * w + b.minX + xx]; if (l >= 0 && l != b.id) { other[xx, yy] = true; if (!b.mask[xx, yy]) outside = true } }
+            // a outra peça só muda a forma se cair num vão do casco (ShapeClassifier.gaps: fora da máscara); toda dentro
+            // da máscara (furo pequeno fechado), a reclassificação daria o mesmo ShapeFit
+            if (outside) blobs[i] = Blob(b.id, b.count, b.minX, b.minY, b.maxX, b.maxY, b.color, b.hue, b.mask, ShapeClassifier.classify(b.mask, other), b.family)
+        }
+        val kept = blobs.sortedByDescending { it.count }.take(maxBlobs)
+        if (kept.size < blobs.size) {
+            val ok = BooleanArray(created); for (b in kept) ok[b.id] = true
+            for (i in 0 until n) { val l = label[i]; if (l >= 0 && !ok[l]) label[i] = -1 }
+        }
+        return Segmentation(w, h, label, kept, L, fg, A, B, magnet = magnet, bgLab = if (loose) floatArrayOf(bgL, bgA, bgB) else null, rgb = px)
+    }
+
+    /**
+     * Fundo (L, a*, b*): mediana de a/b do ANEL externo do quadro (a construção fica no meio e pode encher o quadro);
+     * se o anel for colorido (toalha, parede), a/b vêm da mediana do quadro inteiro. Uma amostra a cada [step] pixels:
+     * o Lab delas fica em [sl], [sa], [sb] (a passada principal reaproveita).
+     */
+    private fun background(px: IntArray, w: Int, h: Int, step: Int, sl: FloatArray, sa: FloatArray, sb: FloatArray): FloatArray {
+        val n = w * h
+        val mx = w / 10; val my = h / 10
+        val samples = sl.size
+        val ra = FloatArray(samples); val rb = FloatArray(samples); val rl = FloatArray(samples); var ring = 0
+        var i = 0; var k = 0; var x = 0; var y = 0 // x = i % w, y = i / w
+        while (i < n) {
+            labInto(px[i], sl, sa, sb, k)
+            if (x < mx || x >= w - mx || y < my || y >= h - my) { ra[ring] = sa[k]; rb[ring] = sb[k]; rl[ring] = sl[k]; ring++ }
+            k++; i += step; x += step; while (x >= w) { x -= w; y++ }
+        }
+        var bgA = select(ra, ring, ring / 2); var bgB = select(rb, ring, ring / 2)
+        val bgL = select(rl, ring, ring / 2)
+        if (!ringBackground || sqrt(bgA * bgA + bgB * bgB) > 15f) { bgA = select(sa, k, k / 2); bgB = select(sb, k, k / 2) }
+        return floatArrayOf(bgL, bgA, bgB)
+    }
+
+    /**
+     * Lab de cada pixel em L, A, B (as amostras do fundo, a cada [step], já vêm em [sl], [sa], [sb]) e o primeiro plano:
+     * sqrt(da² + db²) > limiar ⇔ da² + db² > [cut] (corte exato) e L* > 12, também empacotado em [bits] (linha y em
+     * [words] Longs a partir de y·words) para o fechamento. Com [dark], marca os candidatos a ímã (L < [darkL],
+     * da² + db² ≤ [darkCut]), põe os índices deles em [darkIdx] (em ordem) e devolve quantos.
+     */
+    private fun labForeground(px: IntArray, L: FloatArray, A: FloatArray, B: FloatArray, step: Int, sl: FloatArray, sa: FloatArray, sb: FloatArray,
+                              bgA: Float, bgB: Float, cut: Float, fg: BooleanArray, bits: LongArray,
+                              w: Int, h: Int, words: Int, dark: BooleanArray?, darkIdx: IntArray, darkL: Float, darkCut: Float): Int {
+        var nDark = 0
+        var next = 0; var k = 0 // próxima amostra do fundo (já tem o Lab)
+        for (y in 0 until h) {
+            val row = y * w; val wrow = y * words
+            var word = 0L
+            for (x in 0 until w) {
+                val i = row + x
+                if (i == next) { L[i] = sl[k]; A[i] = sa[k]; B[i] = sb[k]; k++; next += step } else labInto(px[i], L, A, B, i)
+                val da = A[i] - bgA; val db = B[i] - bgB; val s = da * da + db * db; val l = L[i]
+                val v = s > cut && l > 12f
+                fg[i] = v
+                if (v) word = word or (1L shl x)
+                if ((x and 63) == 63) { bits[wrow + (x ushr 6)] = word; word = 0L }
+                if (dark != null) { val d = l < darkL && s <= darkCut; dark[i] = d; if (d) darkIdx[nDark++] = i }
+            }
+            if ((w and 63) != 0) bits[wrow + words - 1] = word
+        }
+        return nDark
+    }
+
+    /**
+     * Ímãs em [magnet]: mancha escura (sc.dark; os [nDark] pixels dela em sc.darkIdx, em ordem) de até magnetMaxFrac do
+     * quadro colada no primeiro plano.
+     */
+    private fun findMagnets(magnet: BooleanArray, fg: BooleanArray, nDark: Int, w: Int, n: Int, sc: Scratch) {
+        val dark = sc.dark; val seen = sc.seen; val q = sc.q; val qx = sc.qx; val idx = sc.darkIdx
+        for (j in 0 until nDark) seen[idx[j]] = false // só pixel escuro é marcado
+        val maxCells = max(8, (n * magnetMaxFrac).toInt())
+        for (jj in 0 until nDark) {
+            val s0 = idx[jj]
+            if (seen[s0]) continue
+            var head = 0; var tail = 0; q[tail] = s0; qx[tail] = s0 % w; tail++; seen[s0] = true; var touches = false
+            while (head < tail) {
+                val i = q[head]; val x = qx[head]; head++
+                if (x > 0) { val k = i - 1; if (dark[k]) { if (!seen[k]) { seen[k] = true; q[tail] = k; qx[tail] = x - 1; tail++ } } else if (fg[k]) touches = true }
+                if (x < w - 1) { val k = i + 1; if (dark[k]) { if (!seen[k]) { seen[k] = true; q[tail] = k; qx[tail] = x + 1; tail++ } } else if (fg[k]) touches = true }
+                if (i >= w) { val k = i - w; if (dark[k]) { if (!seen[k]) { seen[k] = true; q[tail] = k; qx[tail] = x; tail++ } } else if (fg[k]) touches = true }
+                if (i + w < n) { val k = i + w; if (dark[k]) { if (!seen[k]) { seen[k] = true; q[tail] = k; qx[tail] = x; tail++ } } else if (fg[k]) touches = true }
+            }
+            if (touches && tail <= maxCells) for (j in 0 until tail) magnet[q[j]] = true
+        }
+    }
+
+    /**
+     * Fechamento ([r]× Mask.dilate e depois [r]× Mask.erode, fora do quadro = vazio) do primeiro plano em bits (sc.b0,
+     * que fica intacto); [bridge] = fechado e não primeiro plano. Devolve o fechado em bits (sc.b1 ou sc.b2).
+     */
+    private fun closing(bridge: BooleanArray, r: Int, w: Int, h: Int, words: Int, sc: Scratch): LongArray {
+        val fgBits = sc.b0
+        dilateBits(fgBits, sc.b1, w, h, words)
+        var cur = sc.b1; var tmp = sc.b2
+        repeat(r - 1) { dilateBits(cur, tmp, w, h, words); val s = cur; cur = tmp; tmp = s }
+        repeat(r) { erodeBits(cur, tmp, h, words); val s = cur; cur = tmp; tmp = s }
+        java.util.Arrays.fill(bridge, 0, w * h, false)
+        for (y in 0 until h) {
+            val row = y * w; val wrow = y * words
+            for (j in 0 until words) {
+                var v = cur[wrow + j] and fgBits[wrow + j].inv()
+                while (v != 0L) { bridge[row + (j shl 6) + java.lang.Long.numberOfTrailingZeros(v)] = true; v = v and (v - 1) }
+            }
+        }
+        return cur
+    }
+
+    /**
+     * Cresce as regiões ([raw]: região de cada pixel, −1 = nenhuma) a partir de cada pixel de primeiro plano ainda
+     * livre, em ordem de varredura (os bits de [fgBits]), por busca em largura (vizinhos esquerda, direita, cima, baixo).
+     */
+    private fun grow(L: FloatArray, A: FloatArray, B: FloatArray, fg: BooleanArray, bridge: BooleanArray, raw: IntArray, q: IntArray, qx: IntArray, fgBits: LongArray,
+                     w: Int, h: Int, words: Int, bgA: Float, bgB: Float, C: FloatArray?, Hc: FloatArray?, Hs: FloatArray?): ArrayList<Reg> {
+        val n = w * h
+        java.util.Arrays.fill(raw, 0, n, -1)
+        val regs = ArrayList<Reg>()
+        // limiares de cor ao quadrado (cortes exatos das comparações com sqrt)
+        val cut16 = lastWhere { sqrt(it) <= 16f }
+        val cut7 = lastWhere { !(sqrt(it) > 7f) }
+        val hue = hueGrowing
+        var region = 0
+        for (sy in 0 until h) for (j in 0 until words) {
+            var v = fgBits[sy * words + j]
+            while (v != 0L) {
+                val sx = (j shl 6) + java.lang.Long.numberOfTrailingZeros(v); v = v and (v - 1)
+                val s = sy * w + sx
+                if (raw[s] >= 0) continue
+                var head = 0; var tail = 0; q[tail] = s; qx[tail] = sx; tail++; raw[s] = region
+                // matiz médio da região = soma dos vetores (cos, sin) pesada pelo croma (média circular) + média de a/b/L
+                var sumHc = 0.0; var sumHs = 0.0
+                if (hue) { sumHc = (Hc!![s] * C!![s]).toDouble(); sumHs = (Hs!![s] * C[s]).toDouble() }
+                var sumL = L[s].toDouble(); var sumA = A[s].toDouble(); var sumB = B[s].toDouble(); var cnt = 1
+                var x0 = w; var x1 = 0; var i0 = n; var i1 = -1
+                // médias da região: só mudam quando entra pixel de cor (cnt muda junto com as somas)
+                var mA = 0f; var mB = 0f; var mL = 0f; var meanCnt = 0
+                while (head < tail) {
+                    val i = q[head]; val x = qx[head]; head++
+                    if (x < x0) x0 = x; if (x > x1) x1 = x; if (i < i0) i0 = i; if (i > i1) i1 = i
+                    var mcx = 0f; var mcy = 0f
+                    if (hue) { val ml = sqrt(sumHc * sumHc + sumHs * sumHs).coerceAtLeast(1e-9); mcx = (sumHc / ml).toFloat(); mcy = (sumHs / ml).toFloat() }
+                    if (cnt != meanCnt) { mA = (sumA / cnt).toFloat(); mB = (sumB / cnt).toFloat(); mL = (sumL / cnt).toFloat(); meanCnt = cnt }
+                    val fi = fg[i]; val bi = bridge[i]; val ai = A[i]; val bbi = B[i]
+                    for (d in 0 until 4) {
+                        val k: Int; val xk: Int
+                        if (d == 0) { if (x == 0) continue; k = i - 1; xk = x - 1 }
+                        else if (d == 1) { if (x == w - 1) continue; k = i + 1; xk = x + 1 }
+                        else if (d == 2) { k = i - w; if (k < 0) continue; xk = x }
+                        else { k = i + w; if (k >= n) continue; xk = x }
+                        if (raw[k] >= 0) continue
+                        if (fg[k]) {
+                            // Entra se (a) tem o mesmo MATIZ da região (22°; 40° quando pouco saturado) e do vizinho (18°):
+                            // aro, painel translúcido e vincos da mesma peça; OU (b) está perto da média de a/b/L da região
+                            // e do vizinho (degradê suave, como nas fotos reais em que o painel puxa para a cor do fundo).
+                            // A peça do lado, de outra cor, falha nas duas.
+                            // Pelo matiz só de um pixel saturado da própria região para outro saturado vizinho (aro → painel):
+                            // vindo por uma ponte (ímã/sulco escuro) a cor tem que bater de verdade, senão a região atravessa
+                            // o ímã da peça do lado e entra no painel dela (laranja × rosa nas fotos reais).
+                            val byHue = hue && fi && C!![i] > 18f && C[k] > 14f && Hc!![k] * mcx + Hs!![k] * mcy >= HUE_22 && !(C[k] > 18f && Hc[k] * Hc[i] + Hs[k] * Hs[i] < HUE_18)
+                            val ak = A[k]; val bk = B[k]
+                            if (!byHue) {
+                                val da = ak - mA; val db = bk - mB
+                                if (da * da + db * db > cut16 || abs(L[k] - mL) > 38f) continue
+                                if (fi) { val ea = ak - ai; val eb = bk - bbi; if (ea * ea + eb * eb > cut7) continue }
+                            }
+                            if (hue) { sumHc += Hc!![k] * C!![k]; sumHs += Hs!![k] * C[k] }
+                            sumL += L[k]; sumA += ak; sumB += bk; cnt++
+                        } else if (!bridge[k] || !fi && !bi) continue
+                        raw[k] = region; q[tail] = k; qx[tail] = xk; tail++
+                    }
                 }
-            }
-            val cosJ = kotlin.math.cos(Math.toRadians(joinHueDeg.toDouble()))
-            // compara os GRUPOS (média pelos pixels de cor), não só o par: uma borda borrada com matiz intermediário
-            // não pode encadear duas peças (vidro da janela → borda → moldura)
-            val gn = DoubleArray(nr) { regs[it].cnt.toDouble() }; val ga = DoubleArray(nr) { regs[it].da * gn[it] }
-            val gb = DoubleArray(nr) { regs[it].db * gn[it] }; val gl = DoubleArray(nr) { regs[it].l * gn[it] }
-            val pairs = contact.entries.mapNotNull { (key, c) ->
-                val a = (key / nr).toInt(); val b = (key % nr).toInt(); val frac = c.toFloat() / min(per[a], per[b])
-                if (frac >= joinContact) Triple(a, b, frac) else null
-            }.sortedByDescending { it.third }
-            for ((a, b) in pairs) {
-                val fa = find(a); val fb = find(b); if (fa == fb) continue
-                val ax = ga[fa] / gn[fa]; val ay = gb[fa] / gn[fa]; val bx = ga[fb] / gn[fb]; val by = gb[fb] / gn[fb]
-                val la = kotlin.math.hypot(ax, ay); val lb = kotlin.math.hypot(bx, by)
-                if (la < 10.0 || lb < 10.0 || (ax * bx + ay * by) / (la * lb) < cosJ) continue // sem cor / outro matiz
-                if (min(la, lb) < joinMinChroma * max(la, lb)) continue // borda pálida
-                // aro, painel e vincos têm brilho parecido (≤ 10); peça clara encaixada numa escura não
-                if (abs(gl[fa] / gn[fa] - gl[fb] / gn[fb]) > joinMaxDL) continue
-                val keep = min(fa, fb); val gone = max(fa, fb)
-                root[gone] = keep; gn[keep] += gn[gone]; ga[keep] += ga[gone]; gb[keep] += gb[gone]; gl[keep] += gl[gone]
+                region++
+                regs += Reg(cnt, sumA / cnt - bgA, sumB / cnt - bgB, sumL / cnt, x0, i0 / w, x1, i1 / w)
             }
         }
-        // grupos (região sozinha ou pedaços juntados)
-        val members = HashMap<Int, MutableList<Int>>()
-        for (k in 0 until nr) members.getOrPut(find(k)) { ArrayList(1) } += k
-        class Grp(val g: Int, val ms: List<Int>, val x0: Int, val y0: Int, val x1: Int, val y1: Int, val color: Int, val chroma: Double)
-        val groups = members.entries.sortedBy { it.key }.map { (g, ms) ->
-            var x0 = w; var y0 = h; var x1 = 0; var y1 = 0; var colorCnt = 0; var sa = 0.0; var sb = 0.0
-            for (k in ms) { val rg = regs[k]; x0 = min(x0, rg.x0); y0 = min(y0, rg.y0); x1 = max(x1, rg.x1); y1 = max(y1, rg.y1); colorCnt += rg.cnt; sa += rg.da * rg.cnt; sb += rg.db * rg.cnt }
-            Grp(g, ms, x0, y0, x1, y1, colorCnt, kotlin.math.hypot(sa / max(1, colorCnt), sb / max(1, colorCnt)))
+        return regs
+    }
+
+    private fun find(root: IntArray, x: Int): Int { var a = x; while (root[a] != a) { root[a] = root[root[a]]; a = root[a] }; return a }
+
+    /**
+     * Junta (em [root]) as regiões vizinhas que são pedaços da mesma peça. Pixels de região estão no primeiro plano ou
+     * no fechado ([fgBits] | [closed]): só esses são visitados, em ordem de varredura.
+     */
+    private fun joinPieces(raw: IntArray, regs: List<Reg>, root: IntArray, fgBits: LongArray, closed: LongArray, w: Int, h: Int, words: Int) {
+        val nr = regs.size
+        val per = IntArray(nr); val contact = HashMap<Long, Int>()
+        // vizinhos na ordem esquerda, direita, cima, baixo (fora do quadro conta como borda); a ordem de inserção no
+        // mapa decide o desempate dos pares com a mesma fração de contato
+        for (y in 0 until h) for (j in 0 until words) {
+            val row = y * w
+            var v = fgBits[y * words + j] or closed[y * words + j]
+            while (v != 0L) {
+                val x = (j shl 6) + java.lang.Long.numberOfTrailingZeros(v); v = v and (v - 1)
+                val i = row + x
+                val a = raw[i]; if (a < 0) continue
+                var b = if (x > 0) raw[i - 1] else -1
+                if (b != a) { per[a]++; if (b > a) contact.merge(a.toLong() * nr + b, 1, Int::plus) }
+                b = if (x < w - 1) raw[i + 1] else -1
+                if (b != a) { per[a]++; if (b > a) contact.merge(a.toLong() * nr + b, 1, Int::plus) }
+                b = if (y > 0) raw[i - w] else -1
+                if (b != a) { per[a]++; if (b > a) contact.merge(a.toLong() * nr + b, 1, Int::plus) }
+                b = if (y < h - 1) raw[i + w] else -1
+                if (b != a) { per[a]++; if (b > a) contact.merge(a.toLong() * nr + b, 1, Int::plus) }
+            }
         }
+        val cosJ = kotlin.math.cos(Math.toRadians(joinHueDeg.toDouble()))
+        // compara os GRUPOS (média pelos pixels de cor), não só o par: uma borda borrada com matiz intermediário
+        // não pode encadear duas peças (vidro da janela → borda → moldura)
+        val gn = DoubleArray(nr) { regs[it].cnt.toDouble() }; val ga = DoubleArray(nr) { regs[it].da * gn[it] }
+        val gb = DoubleArray(nr) { regs[it].db * gn[it] }; val gl = DoubleArray(nr) { regs[it].l * gn[it] }
+        val pairs = contact.entries.mapNotNull { (key, c) ->
+            val a = (key / nr).toInt(); val b = (key % nr).toInt(); val frac = c.toFloat() / min(per[a], per[b])
+            if (frac >= joinContact) Triple(a, b, frac) else null
+        }.sortedByDescending { it.third }
+        for ((a, b) in pairs) {
+            val fa = find(root, a); val fb = find(root, b); if (fa == fb) continue
+            val ax = ga[fa] / gn[fa]; val ay = gb[fa] / gn[fa]; val bx = ga[fb] / gn[fb]; val by = gb[fb] / gn[fb]
+            val la = kotlin.math.hypot(ax, ay); val lb = kotlin.math.hypot(bx, by)
+            if (la < 10.0 || lb < 10.0 || (ax * bx + ay * by) / (la * lb) < cosJ) continue // sem cor / outro matiz
+            if (min(la, lb) < joinMinChroma * max(la, lb)) continue // borda pálida
+            // aro, painel e vincos têm brilho parecido (≤ 10); peça clara encaixada numa escura não
+            if (abs(gl[fa] / gn[fa] - gl[fb] / gn[fb]) > joinMaxDL) continue
+            val keep = min(fa, fb); val gone = max(fa, fb)
+            root[gone] = keep; gn[keep] += gn[gone]; ga[keep] += ga[gone]; gb[keep] += gb[gone]; gl[keep] += gl[gone]
+        }
+    }
+
+    /**
+     * Grupos (região sozinha ou pedaços juntados) → blobs em [blobs] e rótulos em [label], na ordem da raiz do grupo
+     * (= menor região dele); caixa, pixels de cor e croma somados na ordem das regiões.
+     */
+    private fun groupBlobs(blobs: ArrayList<Blob>, label: IntArray, raw: IntArray, regs: List<Reg>, root: IntArray, px: IntArray, L: FloatArray, fg: BooleanArray,
+                           w: Int, h: Int, minFrac: Float, maxFrac: Float, loose: Boolean, smallFrac: Float) {
+        val n = w * h; val nr = regs.size
+        val gSize = IntArray(nr); val gx0 = IntArray(nr); val gy0 = IntArray(nr); val gx1 = IntArray(nr); val gy1 = IntArray(nr)
+        val gColor = IntArray(nr); val gsa = DoubleArray(nr); val gsb = DoubleArray(nr)
+        for (k in 0 until nr) {
+            val g = find(root, k); val rg = regs[k]
+            if (gSize[g] == 0) { gx0[g] = w; gy0[g] = h; gx1[g] = 0; gy1[g] = 0 }
+            gSize[g]++
+            gx0[g] = min(gx0[g], rg.x0); gy0[g] = min(gy0[g], rg.y0); gx1[g] = max(gx1[g], rg.x1); gy1[g] = max(gy1[g], rg.y1)
+            gColor[g] += rg.cnt; gsa[g] += rg.da * rg.cnt; gsb[g] += rg.db * rg.cnt
+        }
+        val gChroma = DoubleArray(nr)
+        for (g in 0 until nr) if (gSize[g] > 0) gChroma[g] = kotlin.math.hypot(gsa[g] / max(1, gColor[g]), gsb[g] / max(1, gColor[g]))
         // Peça pequena (pequeno a 45 cm: 250-450 px de 480×360, abaixo do mínimo antigo de 0,2% = 345 px): entre
         // [smallFrac] e [minFrac] só entra se for tão colorida quanto as peças grandes da foto (croma médio ≥ [smallChroma]
         // × mediana das grandes). Plástico incolor (a ameia transparente da foto real), reflexo, sombra colorida e borda
         // pálida que não se juntou à peça ficam com pouca cor; peça pequena de verdade tem a cor das grandes.
-        val bigChroma = groups.filter { it.color >= n * minFrac && it.color <= n * maxFrac }.map { it.chroma }.sorted()
-        val refChroma = if (bigChroma.isEmpty()) smallChromaAbs else bigChroma[bigChroma.size / 2]
-        for (gr in groups) {
-            val x0 = gr.x0; val y0 = gr.y0; val x1 = gr.x1; val y1 = gr.y1; val g = gr.g
+        var nBig = 0
+        for (g in 0 until nr) if (gSize[g] > 0 && gColor[g] >= n * minFrac && gColor[g] <= n * maxFrac) nBig++
+        val bigChroma = DoubleArray(nBig)
+        run { var k = 0; for (g in 0 until nr) if (gSize[g] > 0 && gColor[g] >= n * minFrac && gColor[g] <= n * maxFrac) bigChroma[k++] = gChroma[g] }
+        bigChroma.sort()
+        val refChroma = if (nBig == 0) smallChromaAbs else bigChroma[nBig / 2]
+        for (g in 0 until nr) {
+            if (gSize[g] == 0) continue
+            val x0 = gx0[g]; val y0 = gy0[g]; val x1 = gx1[g]; val y1 = gy1[g]; val color = gColor[g]
             val bw = x1 - x0 + 1; val bh = y1 - y0 + 1
-            val small = loose && gr.color < n * minFrac
-            if (gr.color > n * maxFrac || bw < 4 || bh < 4) continue
-            if (!loose && gr.color < n * minFrac) continue
-            if (small && (gr.color < n * smallFrac || gr.chroma < smallChroma * refChroma)) continue
-            val mask = Mask(bw, bh)
-            if (gr.ms.size == 1) { for (yy in y0..y1) for (xx in x0..x1) if (raw[yy * w + xx] == g) mask[xx - x0, yy - y0] = true }
-            else for (yy in y0..y1) for (xx in x0..x1) { val l = raw[yy * w + xx]; if (l >= 0 && find(l) == g) mask[xx - x0, yy - y0] = true }
+            val small = loose && color < n * minFrac
+            if (color > n * maxFrac || bw < 4 || bh < 4) continue
+            if (!loose && color < n * minFrac) continue
+            if (small && (color < n * smallFrac || gChroma[g] < smallChroma * refChroma)) continue
+            val mask = Mask(bw, bh); val mb = mask.bits
+            if (gSize[g] == 1) { for (yy in y0..y1) { val row = yy * w; val o = (yy - y0) * bw - x0; for (xx in x0..x1) if (raw[row + xx] == g) mb[o + xx] = true } }
+            else for (yy in y0..y1) { val row = yy * w; val o = (yy - y0) * bw - x0; for (xx in x0..x1) { val l = raw[row + xx]; if (l >= 0 && find(root, l) == g) mb[o + xx] = true } }
             // duas peças da mesma cor encostadas (ou uma atrás da outra) viram uma região só: a emenda entre elas
             // é uma fileira de ímãs escuros + degrau de brilho entre as faces. Divide por essa linha.
             val parts = if (seamSplitting) seamSplit(mask, x0, y0, w, L, fg, 0, weak = false) else listOf(mask)
             val family = if (parts.size > 1) g else -1
             for (part in parts) {
                 val b = blobFromPart(part, x0, y0, w, px, fg, blobs.size, family, (n * (if (small) smallFrac else minFrac)).toInt()) ?: continue
-                for (yy in 0 until part.h) for (xx in 0 until part.w) if (part[xx, yy]) label[(y0 + yy) * w + x0 + xx] = b.id
+                val pb = part.bits; val pw = part.w
+                for (yy in 0 until part.h) { val o = yy * pw; val row = (y0 + yy) * w + x0; for (xx in 0 until pw) if (pb[o + xx]) label[row + xx] = b.id }
                 blobs += b
             }
         }
-        mergeOverlapping(blobs, label, w)
-        // entalhe que é outra peça na frente não é forma: reclassifica sabendo onde estão as outras peças
-        if (occlusionReclassify) for (i in blobs.indices) {
-            val b = blobs[i]; val f = b.fit ?: continue
-            if (f.gaps.isEmpty()) continue
-            val other = Mask(b.bw, b.bh); var any = false
-            for (yy in 0 until b.bh) for (xx in 0 until b.bw) { val l = label[(b.minY + yy) * w + b.minX + xx]; if (l >= 0 && l != b.id) { other[xx, yy] = true; any = true } }
-            if (any) blobs[i] = Blob(b.id, b.count, b.minX, b.minY, b.maxX, b.maxY, b.color, b.hue, b.mask, ShapeClassifier.classify(b.mask, other), b.family)
+    }
+
+    /** Mask.dilate() em bits: cada linha em [words] Longs (bit x da linha = pixel x); bits além de [w] ficam 0. */
+    private fun dilateBits(src: LongArray, dst: LongArray, w: Int, h: Int, words: Int) {
+        val tailMask = if ((w and 63) == 0) -1L else (1L shl (w and 63)) - 1
+        for (y in 0 until h) {
+            val o = y * words
+            for (j in 0 until words) {
+                val c = src[o + j]
+                var v = c or (c shl 1) or (c ushr 1)
+                if (j > 0) v = v or (src[o + j - 1] ushr 63)
+                if (j < words - 1) v = v or (src[o + j + 1] shl 63)
+                if (y > 0) v = v or src[o - words + j]
+                if (y < h - 1) v = v or src[o + words + j]
+                dst[o + j] = v
+            }
+            dst[o + words - 1] = dst[o + words - 1] and tailMask
         }
-        val kept = blobs.sortedByDescending { it.count }.take(maxBlobs)
-        if (kept.size < blobs.size) { val ok = kept.map { it.id }.toSet(); for (i in 0 until n) if (label[i] >= 0 && label[i] !in ok) label[i] = -1 }
-        return Segmentation(w, h, label, kept, L, fg, A, B, magnet = if (marked) magnet else null, bgLab = if (loose) floatArrayOf(bgL, bgA, bgB) else null, rgb = px)
+    }
+
+    /** Mask.erode() em bits (fora do quadro = vazio: a borda sempre sai vazia). */
+    private fun erodeBits(src: LongArray, dst: LongArray, h: Int, words: Int) {
+        for (y in 0 until h) {
+            val o = y * words
+            for (j in 0 until words) {
+                val c = src[o + j]
+                val left = (c shl 1) or (if (j > 0) src[o + j - 1] ushr 63 else 0L)
+                val right = (c ushr 1) or (if (j < words - 1) src[o + j + 1] shl 63 else 0L)
+                var v = c and left and right
+                v = if (y > 0) v and src[o - words + j] else 0L
+                v = if (y < h - 1) v and src[o + words + j] else 0L
+                dst[o + j] = v
+            }
+        }
     }
 
     /** Blob a partir de uma parte ([part] no recorte que começa em [x0],[y0] da imagem de largura [w]). */
     private fun blobFromPart(part: Mask, x0: Int, y0: Int, w: Int, px: IntArray, fg: BooleanArray, id: Int, family: Int, minCount: Int): Blob? {
         var px0 = part.w; var py0 = part.h; var px1 = 0; var py1 = 0; var cnt = 0; var pr = 0L; var pg = 0L; var pb = 0L
-        for (yy in 0 until part.h) for (xx in 0 until part.w) if (part[xx, yy]) {
-            px0 = min(px0, xx); px1 = max(px1, xx); py0 = min(py0, yy); py1 = max(py1, yy)
-            val i = (y0 + yy) * w + x0 + xx
-            if (fg[i]) { pr += px[i] shr 16 and 255; pg += px[i] shr 8 and 255; pb += px[i] and 255; cnt++ }
+        val bits = part.bits; val pw = part.w
+        for (yy in 0 until part.h) {
+            val o = yy * pw; val row = (y0 + yy) * w + x0
+            for (xx in 0 until pw) if (bits[o + xx]) {
+                if (xx < px0) px0 = xx; if (xx > px1) px1 = xx; if (yy < py0) py0 = yy; if (yy > py1) py1 = yy
+                val i = row + xx
+                if (fg[i]) { val c = px[i]; pr += c shr 16 and 255; pg += c shr 8 and 255; pb += c and 255; cnt++ }
+            }
         }
         if (cnt < minCount || cnt == 0 || px1 - px0 + 1 < 4 || py1 - py0 + 1 < 4) return null
-        val pm = Mask(px1 - px0 + 1, py1 - py0 + 1)
-        for (yy in py0..py1) for (xx in px0..px1) if (part[xx, yy]) pm[xx - px0, yy - py0] = true
+        val pm = Mask(px1 - px0 + 1, py1 - py0 + 1); val mb = pm.bits; val mw = pm.w
+        for (yy in py0..py1) { val o = yy * pw; val oo = (yy - py0) * mw - px0; for (xx in px0..px1) if (bits[o + xx]) mb[oo + xx] = true }
         fillSmallHoles(pm, max(4, cnt / 60))
         val color = (0xFF shl 24) or ((pr / cnt).toInt() shl 16) or ((pg / cnt).toInt() shl 8) or (pb / cnt).toInt()
         val t = FloatArray(3); hsv(color, t)
@@ -368,7 +676,8 @@ object Segmenter {
                 val color = (0xFF shl 24) or (((ch(a.color, 16) * a.count + ch(b.color, 16) * b.count) / cnt) shl 16) or (((ch(a.color, 8) * a.count + ch(b.color, 8) * b.count) / cnt) shl 8) or ((ch(a.color, 0) * a.count + ch(b.color, 0) * b.count) / cnt)
                 hsv(color, t)
                 val merged = Blob(a.id, cnt, x0, y0, x1, y1, color, t[0], m, ShapeClassifier.classify(m))
-                for (k in label.indices) if (label[k] == b.id) label[k] = a.id
+                // os rótulos de b só existem dentro da caixa dele
+                for (yy in b.minY..b.maxY) { val row = yy * w; for (xx in b.minX..b.maxX) if (label[row + xx] == b.id) label[row + xx] = a.id }
                 blobs[i] = merged; blobs.removeAt(j)
                 changed = true; break@loop
             }
@@ -461,15 +770,26 @@ object Segmenter {
         return seamSplit(a, x0, y0, w, L, fg, depth + 1, weak) + seamSplit(b, x0, y0, w, L, fg, depth + 1, weak)
     }
 
-    /** Preenche buracos pequenos (riscos, reflexos) sem fechar os vãos de verdade (janela, porta). */
+    /**
+     * Preenche buracos pequenos (riscos, reflexos) sem fechar os vãos de verdade (janela, porta): componente (4-vizinhos)
+     * do vazio com até [maxCells] células que não encosta na borda do recorte. Uma busca por componente, sem a máscara
+     * inteira por componente de Mask.components.
+     */
     private fun fillSmallHoles(m: Mask, maxCells: Int) {
-        val inv = Mask(m.w, m.h, BooleanArray(m.w * m.h) { !m.bits[it] })
-        for (c in inv.components(minCells = 1)) {
-            if (c.count() > maxCells) continue
-            var border = false
-            for (y in 0 until c.h) { if (c[0, y] || c[c.w - 1, y]) { border = true; break } }
-            if (!border) for (x in 0 until c.w) if (c[x, 0] || c[x, c.h - 1]) { border = true; break }
-            if (!border) for (i in c.bits.indices) if (c.bits[i]) m.bits[i] = true
+        val w = m.w; val h = m.h; val bits = m.bits; val n = w * h
+        val seen = BooleanArray(n); val q = IntArray(n)
+        for (s in 0 until n) {
+            if (bits[s] || seen[s]) continue
+            var head = 0; var tail = 0; q[tail++] = s; seen[s] = true; var border = false
+            while (head < tail) {
+                val i = q[head++]; val y = i / w; val x = i - y * w
+                if (x == 0 || x == w - 1 || y == 0 || y == h - 1) border = true
+                if (x > 0) { val k = i - 1; if (!bits[k] && !seen[k]) { seen[k] = true; q[tail++] = k } }
+                if (x < w - 1) { val k = i + 1; if (!bits[k] && !seen[k]) { seen[k] = true; q[tail++] = k } }
+                if (y > 0) { val k = i - w; if (!bits[k] && !seen[k]) { seen[k] = true; q[tail++] = k } }
+                if (y < h - 1) { val k = i + w; if (!bits[k] && !seen[k]) { seen[k] = true; q[tail++] = k } }
+            }
+            if (!border && tail <= maxCells) for (j in 0 until tail) bits[q[j]] = true
         }
     }
 }
