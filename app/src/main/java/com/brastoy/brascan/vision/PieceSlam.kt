@@ -122,6 +122,9 @@ class PieceSlam(private val k: Intrinsics, private val autoOptimize: Boolean = t
     private fun badFrame() { badStreak++; lastMatched = 0; if (badStreak >= LOST_AFTER && camera != null) lost = true }
     var frames = 0; private set
     var lastMatched = 0; private set
+    /** Peça do mapa (id) que cada detecção do último quadro atualizou ou criou. Vazio = o quadro não encaixou no mapa (câmera parada no quadro anterior). */
+    var lastAssoc: Map<Detection, Int> = emptyMap(); private set
+    private val assocNow = HashMap<Detection, MapPiece>()
     /** Quadro-chave: pose da câmera, gravidade e cantos medidos de cada peça (para o ajuste global). */
     class Keyframe(var pose: Pose, val up: DoubleArray?, val obs: List<Pair<Int, PlanarObs>>)
     /** Cantos do molde (m, tamanho grande) ↔ pixels; [scale] = tamanho da peça / grande. */
@@ -275,7 +278,7 @@ class PieceSlam(private val k: Intrinsics, private val autoOptimize: Boolean = t
      * Devolve as detecções usadas (para desenhar).
      */
     fun track(seg: Segmentation, upCam: DoubleArray? = null, px: IntArray? = null): List<Detection> {
-        frames++
+        frames++; assocNow.clear(); lastAssoc = emptyMap()
         val dets = detect(seg, px)
         if (dets.isEmpty()) { badFrame(); return dets }
         val cam0 = camera
@@ -285,8 +288,9 @@ class PieceSlam(private val k: Intrinsics, private val autoOptimize: Boolean = t
             if (good.isEmpty()) return dets
             val c = Pose(alignUp(upCam), doubleArrayOf(0.0, 0.0, 0.0))
             camera = c; lost = false; lostFrames = 0
-            val first = good.mapNotNull { d -> newPiece(d, c)?.let { mp -> mp to planarObs(d, d.candidates[0], outlineOf(d.shape)) } }
+            val first = good.mapNotNull { d -> newPiece(d, c)?.let { mp -> assocNow[d] = mp; mp to planarObs(d, d.candidates[0], outlineOf(d.shape)) } }
             maybeKeyframe(c, upCam, first)
+            lastAssoc = assocNow.mapValues { it.value.id }
             return dets
         }
         // mapa que não pegou (nada confirmado) e já está perdido há muito tempo: recomeça do zero
@@ -345,7 +349,7 @@ class PieceSlam(private val k: Intrinsics, private val autoOptimize: Boolean = t
             val s = Catalog.SCALE.getValue(m.mp.size).toDouble()
             val cand = m.det.candidatesFor(m.mp.shape).minBy { c -> Rot.angle(cam.compose(scaled(c, s)).r, m.mp.pose.r) }
             m.mp.add(Obs(cam.compose(scaled(cand, s)), cam.t.clone(), weight(m.det), m.det.candidatesFor(m.mp.shape).map { cam.compose(scaled(it, s)) }, frame = frames, model = outlineOf(m.mp.shape))); m.mp.lastSeen = frames
-            m.mp.votes.merge(m.det.shape, voteOf(m.det), Double::plus); m.mp.update()
+            m.mp.votes.merge(m.det.shape, voteOf(m.det), Double::plus); m.mp.update(); assocNow[m.det] = m.mp
         }
         maybeKeyframe(cam, upCam, inl.map { m ->
             val s = Catalog.SCALE.getValue(m.mp.size).toDouble()
@@ -366,13 +370,14 @@ class PieceSlam(private val k: Intrinsics, private val autoOptimize: Boolean = t
             val alts = near?.let { mp -> d.candidatesFor(mp.shape).map { cam.compose(scaled(it, sc)) } }
             if (near != null && alts!!.minOf { dist(it.t, near.pose.t) } < Catalog.edgeM("grande") * .6) {
                 near.add(Obs(alts.minBy { Rot.angle(it.r, near.pose.r) }, cam.t.clone(), weight(d) * .5, alts, frame = frames, model = outlineOf(near.shape))); near.lastSeen = frames
-                near.votes.merge(d.shape, voteOf(d), Double::plus); near.update()
-            } else newPiece(d, cam)?.let { mp -> born += mp to planarObs(d, d.candidates[0], outlineOf(d.shape)) }
+                near.votes.merge(d.shape, voteOf(d), Double::plus); near.update(); assocNow[d] = near
+            } else newPiece(d, cam)?.let { mp -> assocNow[d] = mp; born += mp to planarObs(d, d.candidates[0], outlineOf(d.shape)) }
         }
         if (born.isNotEmpty()) { val kf = keyframes.lastOrNull(); maybeKeyframe(cam, upCam, born, force = kf == null || kf.pose !== cam) }
         mergeDuplicates()
         // detecção passageira (reflexo, peça cortada na borda): vista < 3 vezes e sumiu há 20 quadros → sai do mapa
         map.removeAll { it.count < MIN_VIEWS && it.baseCount == 0 && frames - it.lastSeen > 20 }
+        lastAssoc = assocNow.mapValues { resolve(it.value.id) } // cópia juntada noutra: vale o id da que ficou
         return dets
     }
 

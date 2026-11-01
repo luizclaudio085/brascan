@@ -74,9 +74,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import java.util.concurrent.Executors
 
 /**
- * Contagem ao vivo: a câmera olha de cima para as peças espalhadas, cada uma ganha uma etiqueta com o tipo e o
- * total por tipo fica estável (mediana dos últimos quadros). "Revisar" congela o quadro para corrigir à mão;
- * "Somar" põe a contagem no inventário.
+ * Contagem ao vivo: a câmera olha de cima para as peças espalhadas e cada peça é rastreada de quadro em quadro
+ * ([Counting.Tracker]): só ganha caixa e etiqueta a que aparece em vários quadros no mesmo lugar, o tipo é o voto dos
+ * quadros e o total por tipo conta as peças rastreadas. "Revisar" congela o quadro para corrigir à mão; "Somar" põe
+ * a contagem no inventário.
  */
 @Composable
 fun CountCameraScreen(onClose: () -> Unit, onAdd: (Map<String, Int>) -> Unit, onFreeze: (CountShot) -> Unit) {
@@ -129,6 +130,7 @@ fun CountCameraScreen(onClose: () -> Unit, onAdd: (Map<String, Int>) -> Unit, on
             Text(when {
                 live.error != null -> live.error!!
                 live.frames == 0 -> "Abrindo a câmera…"
+                live.boxes.isEmpty() && live.seen > 0 -> "Segure parado um instante: conferindo as peças"
                 live.boxes.isEmpty() -> "Não vejo peças: espalhe no chão, aponte de cima, melhore a luz"
                 live.boxes.all { it.cut } -> "As peças estão cortadas na borda: afaste o celular"
                 live.boxes.any { it.fit < .6f } -> "Etiqueta laranja = duvidosa: aproxime ou afaste as peças entre si"
@@ -148,15 +150,27 @@ fun CountCameraScreen(onClose: () -> Unit, onAdd: (Map<String, Int>) -> Unit, on
     }
 }
 
-/** Câmera + detector numa thread própria; publica caixas (imagem em pé, normalizadas) e a contagem estável. */
+/**
+ * Câmera + detector + rastreio numa thread própria; publica as caixas das peças rastreadas (imagem em pé,
+ * normalizadas), a contagem por tipo delas e quantas detecções cruas o quadro teve ([Live.seen]).
+ */
 class CountEngine(private val ctx: Context) {
     data class Live(val boxes: List<Counting.Found> = emptyList(), val counts: Map<String, Int> = emptyMap(), val w: Int = 0, val h: Int = 0,
-                    val frames: Int = 0, val fps: Float = 0f, val torch: Boolean = false, val error: String? = null, val ms: Int = 0)
+                    val frames: Int = 0, val fps: Float = 0f, val torch: Boolean = false, val error: String? = null, val ms: Int = 0, val seen: Int = 0)
     val state = MutableStateFlow(Live())
     private val exec = Executors.newSingleThreadExecutor()
     private var provider: ProcessCameraProvider? = null
     private var camera: Camera? = null
-    private val stab = Counting.Stabilizer(7)
+    /** Só usado na thread de análise. */
+    private val tracker = Counting.Tracker()
+    /** Gravidade do aparelho (TYPE_GRAVITY): com ela o detector retifica o chão direto (mais preciso e ~40% mais rápido). */
+    @Volatile private var gravity: FloatArray? = null
+    @Volatile private var displayRot = android.view.Surface.ROTATION_0
+    private val sensors = ctx.getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
+    private val gravityListener = object : android.hardware.SensorEventListener {
+        override fun onSensorChanged(e: android.hardware.SensorEvent) { gravity = e.values.copyOf(3) }
+        override fun onAccuracyChanged(s: android.hardware.Sensor?, a: Int) = Unit
+    }
     @Volatile private var torchOn = false
     @Volatile private var last: Triple<IntArray, Int, Int>? = null
     @Volatile private var lastFound: List<Counting.Found> = emptyList()
@@ -166,6 +180,8 @@ class CountEngine(private val ctx: Context) {
     fun torch(on: Boolean) { torchOn = on; camera?.cameraControl?.enableTorch(on); state.value = state.value.copy(torch = on) }
 
     fun bind(owner: androidx.lifecycle.LifecycleOwner, pv: PreviewView) {
+        sensors.getDefaultSensor(android.hardware.Sensor.TYPE_GRAVITY)?.let { sensors.registerListener(gravityListener, it, android.hardware.SensorManager.SENSOR_DELAY_UI) }
+        displayRot = pv.display?.rotation ?: android.view.Surface.ROTATION_0
         val f = ProcessCameraProvider.getInstance(ctx)
         f.addListener({
             val p = f.get(); provider = p
@@ -192,15 +208,17 @@ class CountEngine(private val ctx: Context) {
         val (raw, rw, rh) = ArScanView.yuvToArgb(image, Counting.LIVE_W)
         val up = Counting.upright(raw, rw, rh, img.imageInfo.rotationDegrees)
         val t1 = SystemClock.elapsedRealtime()
-        val found = Counting.detect(up.first, up.second, up.third)
+        val found = Counting.detect(up.first, up.second, up.third, groundCam(up.second, up.third))
         val t2 = SystemClock.elapsedRealtime()
-        if (stab.frames % 10 == 0) android.util.Log.i("BraScan", "contagem: conversão ${t1 - t0} ms, detecção ${t2 - t1} ms, ${found.size} peças")
-        last = up; lastFound = found
-        val counts = stab.push(Counting.tally(found))
+        val shown = tracker.push(found, up.second, up.third)
+        val t3 = SystemClock.elapsedRealtime()
+        if (tracker.frames % 10 == 0) android.util.Log.i("BraScan", "contagem: conversão ${t1 - t0} ms, detecção ${t2 - t1} ms, rastreio ${t3 - t2} ms, ${found.size} detectadas, ${shown.size} rastreadas")
+        // na revisão vão as peças rastreadas (o que a tela mostra); antes de confirmar alguma, as detecções do quadro
+        last = up; lastFound = shown.ifEmpty { found }
         val now = SystemClock.elapsedRealtime()
         if (lastT != 0L) fps = fps * .7f + .3f * 1000f / (now - lastT).coerceAtLeast(1)
         lastT = now
-        state.value = Live(found, counts, up.second, up.third, stab.frames, fps, torchOn, ms = (t2 - t0).toInt())
+        state.value = Live(shown, tracker.counts, up.second, up.third, tracker.frames, fps, torchOn, ms = (t3 - t0).toInt(), seen = found.size)
     }
 
     /** O quadro de agora, para revisar com calma. */
@@ -209,5 +227,17 @@ class CountEngine(private val ctx: Context) {
         return CountShot(Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888), lastFound)
     }
 
-    fun stop() { runCatching { provider?.unbindAll() }; exec.shutdown() }
+    /**
+     * Câmera do chão para o detector: foco típico de celular (0,78 do lado maior, o mesmo chute de GroundCam.guess) e a
+     * gravidade do aparelho. A imagem analisada está em pé na orientação da tela; o sensor dá a gravidade nos eixos do
+     * aparelho em retrato, então só vale com a tela em retrato (senão o detector estima a inclinação pelas peças).
+     */
+    private fun groundCam(w: Int, h: Int): com.brastoy.brascan.vision.GroundCam? {
+        val g = gravity ?: return null
+        if (displayRot != android.view.Surface.ROTATION_0 || kotlin.math.sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]) < 5f) return null
+        val f = .78f * maxOf(w, h)
+        return com.brastoy.brascan.vision.GroundCam.fromDeviceGravity(f, f, w / 2f, h / 2f, g[0], g[1], g[2])
+    }
+
+    fun stop() { runCatching { sensors.unregisterListener(gravityListener) }; runCatching { provider?.unbindAll() }; exec.shutdown() }
 }

@@ -9,12 +9,13 @@ import kotlin.math.max
  * O que o scanner sabe neste quadro, para desenhar as peças 3D por cima da imagem da câmera:
  * pose câmera→mundo do SLAM (eixos da câmera: x direita, y baixo, z para frente), intrínsecos na
  * imagem analisada (w×h, orientação do sensor), rotação para a tela em pé e as peças do mapa (em metros)
- * com quantas vezes cada uma foi vista.
+ * com quantas vezes cada uma foi vista. O que entra aqui já foi escolhido por [Holograms] (só o que tem evidência).
  */
 class OverlayFrame(
     val cam: Pose?, val lost: Boolean, val k: Intrinsics, val w: Int, val h: Int, val rot: Int,
+    /** Peças do mapa desenhadas na pose do mapa (no mundo). */
     val pieces: List<Pair<Piece3D, Int>>,
-    /** Peças reconhecidas neste quadro, em coordenadas da CÂMERA (x direita, y baixo, z frente): hologramas ao vivo. */
+    /** Hologramas ao vivo, em coordenadas da CÂMERA (x direita, y baixo, z frente); support = vistas da peça do mapa. */
     val live: List<Piece3D> = emptyList(),
 )
 

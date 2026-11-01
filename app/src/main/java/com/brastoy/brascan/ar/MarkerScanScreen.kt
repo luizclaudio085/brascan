@@ -128,7 +128,7 @@ fun MarkerScanScreen(initialMap: String? = null, onClose: () -> Unit, onDone: (L
             previewIsSurface?.let { surface ->
                 AndroidView(factory = { c -> ArOverlayView(c, onTopOfWindow = !surface).also { engine.overlay = it } }, modifier = Modifier.fillMaxSize())
             }
-            // contornos das peças reconhecidas neste quadro, desenhados por cima da imagem
+            // contornos das peças com holograma neste quadro (as mesmas da RA), desenhados por cima da imagem
             Canvas(Modifier.fillMaxSize()) {
                 val s = status; val k = max(size.width / s.imgW, size.height / s.imgH)
                 val ox = (size.width - s.imgW * k) / 2; val oy = (size.height - s.imgH * k) / 2
@@ -196,6 +196,8 @@ private class Engine(private val ctx: Context, private var initialMap: String?, 
     @Volatile var overlay: ArOverlayView? = null
     @Volatile private var diag: Diagnostico? = null
     @Volatile private var lastRot = 0
+    /** O que já esteve na tela (só na thread de análise): holograma só para o que tem evidência ([Holograms]). */
+    private var holo = Holograms.Memory()
 
     fun startRecording() { exec.execute { diag = Diagnostico(ctx) } }
     fun stopRecording(then: (java.io.File) -> Unit) {
@@ -232,7 +234,7 @@ private class Engine(private val ctx: Context, private var initialMap: String?, 
 
     fun stop() { sm.unregisterListener(this); provider?.unbindAll(); exec.shutdown() }
     /** Recomeçar do zero (também serve para ignorar um mapa salvo que não está batendo). */
-    fun reset() { exec.execute { initialMap = null; slam = intr?.let { PieceSlam(it) } } }
+    fun reset() { exec.execute { initialMap = null; slam = intr?.let { PieceSlam(it) }; holo = Holograms.Memory() } }
 
     /** Ajuste global final + peças + mapa, na thread de análise (não cruza com o rastreio). */
     fun finish(): Pair<List<Piece3D>, String>? = runCatching { exec.submit<Pair<List<Piece3D>, String>?> { slam?.let { it.optimize(); it.pieces() to it.export() } }.get() }.getOrNull()
@@ -318,10 +320,10 @@ private class Engine(private val ctx: Context, private var initialMap: String?, 
         val dets = s.track(seg, up, rgb)
         val now = SystemClock.elapsedRealtime()
         val rot0 = img.imageInfo.rotationDegrees; lastRot = rot0
-        // RA: peças confirmadas do mapa (no mundo) + o que foi reconhecido NESTE quadro, na pose da própria detecção
-        // (cola na peça de verdade mesmo quando o mapa está ruim)
-        overlay?.frame = OverlayFrame(s.camera, s.lost, k, w, h, rot0, s.map.filter { it.count >= PieceSlam.MIN_VIEWS }.map { it.toPiece3D() to it.count },
-            dets.map { d -> val p = d.candidates[0]; Piece3D(d.shape, "grande", d.color, PieceSlam.v3(p.t), PieceSlam.v3(p.col(0)), PieceSlam.v3(p.col(1)), PieceSlam.v3(p.col(2)), 0f, 0f, 1) })
+        // RA: só o que tem evidência (peça confirmada, mesma peça em 2 quadros no mundo ou na imagem), na pose da própria
+        // detecção (cola na peça de verdade mesmo quando o mapa está ruim); reflexo/mão/brilho de um quadro não vira peça
+        val shown = Holograms.frame(s, dets, up, k, holo).also { holo = it.memory }
+        overlay?.frame = OverlayFrame(s.camera, s.lost, k, w, h, rot0, shown.map, shown.live.map { it.second } + shown.held)
         diag?.let { d -> runCatching { d.frame(rgb, w, h, rot0, k, up, s, dets, now - t0) } }
         if (lastT != 0L) fps = fps * .8f + 200f / (now - lastT).coerceAtLeast(1)
         lastT = now
@@ -341,7 +343,7 @@ private class Engine(private val ctx: Context, private var initialMap: String?, 
             pieces.isEmpty() -> "Continue andando devagar: cada peça precisa ser vista de ${PieceSlam.MIN_VIEWS} lugares"
             else -> "${pieces.size} peças no modelo — mostre os outros lados para refinar"
         }
-        publish(MarkerStatus(hint, !s.lost, s.map.size, pieces, dets.map { d -> d.imgCorners.map { upright(it[0], it[1]) } to d.color }, uw, uh, fps, up != null,
+        publish(MarkerStatus(hint, !s.lost, s.map.size, pieces, shown.live.map { (d, _) -> d.imgCorners.map { upright(it[0], it[1]) } to d.color }, uw, uh, fps, up != null,
             target, adv.map { it.text }, s.restoredMap && !s.relocalized,
             s.baReports.count { it.accepted }, s.baReports.lastOrNull { it.accepted }?.rmsAfter ?: Double.NaN,
             diag != null, diag?.frames ?: 0, torchOn))
