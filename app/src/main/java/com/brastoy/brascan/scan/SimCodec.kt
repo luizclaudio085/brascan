@@ -107,16 +107,31 @@ object SimCodec {
             is Raw.Failed -> null to r.message
             is Raw.Ok -> {
                 val o = JSONObject(r.json)
-                val arr = o.getJSONArray("items")
-                val items = (0 until arr.length()).map { i ->
-                    val x = arr.getJSONObject(i); val p = x.getJSONArray("pos"); val q = x.getJSONArray("rot")
-                    Item(x.getString("type"), x.getString("size"), Integer.parseInt(x.getString("color").removePrefix("#"), 16) or (0xFF shl 24),
-                        V3(p.getDouble(0).toFloat(), p.getDouble(1).toFloat(), p.getDouble(2).toFloat()), DoubleArray(4) { q.getDouble(it) })
-                }
+                val items = parseItems(o.getJSONArray("items"))
                 val inv = if (o.isNull("inventory")) null else Inventory.fromSimJson(o.getJSONObject("inventory"))
                 Decoded(items, inv, o.getBoolean("limited"), o.getString("sections")) to null
             }
         }
+    }
+
+    /** items[{type,size,color,pos,rot}] do simulador → [Item]. */
+    fun parseItems(arr: JSONArray): List<Item> = (0 until arr.length()).map { i ->
+        val x = arr.getJSONObject(i); val p = x.getJSONArray("pos"); val q = x.optJSONArray("rot")
+        val c = x.opt("color").let { c -> if (c is Number) c.toInt() else Integer.parseInt(c.toString().removePrefix("#"), 16) } or (0xFF shl 24)
+        Item(x.getString("type"), x.getString("size"), c, V3(p.getDouble(0).toFloat(), p.getDouble(1).toFloat(), p.getDouble(2).toFloat()),
+            if (q == null) doubleArrayOf(0.0, 0.0, 0.0, 1.0) else DoubleArray(4) { q.getDouble(it) })
+    }
+
+    /**
+     * Peças do app a partir dos items de um código: posição exata e base (u, v) = 1ª e 2ª colunas da matriz de
+     * rotação do quatérnio (x, y, z, w), a mesma convenção de [Layout.quat] (ida e volta sem diferença).
+     */
+    fun pieces(items: List<Item>, firstId: Int, evidence: com.brastoy.brascan.vision.Evidence = com.brastoy.brascan.vision.Evidence(com.brastoy.brascan.vision.Evidence.Source.CODIGO)): List<Piece> = items.mapIndexed { i, it ->
+        val n = sqrt(it.rot.sumOf { q -> q * q }).takeIf { l -> l > 1e-9 } ?: 1.0
+        val (x, y, z, w) = it.rot.map { q -> (q / n).toFloat() }
+        val u = V3(1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w))
+        val v = V3(2 * (x * y - z * w), 1 - 2 * (x * x + z * z), 2 * (y * z + x * w))
+        Piece(firstId + i, shape = it.type, size = it.size, color = it.color, pos = it.pos, pu = u, pv = v, evidence = evidence)
     }
 
     private sealed interface Raw { data class Ok(val json: String) : Raw; data class Failed(val message: String) : Raw }

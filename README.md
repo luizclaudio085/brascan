@@ -5,7 +5,10 @@ App Android (Kotlin + Jetpack Compose) para os ímãs Brastoy:
 - **Campo**: magnetômetro em tempo real com o vetor B em **3D** (gira/zoom), rastro, eixos e detector de ímã ("Zerar ambiente").
 - **Scanner 3D (SLAM)**: ARCore rastreia a pose do celular; a cada ~0,3 s o app segmenta a imagem por cor, desprojeta os pixels de cada peça com a profundidade (ou cruza com a nuvem de pontos do SLAM), funde tudo num mapa de voxels e, por geometria (RANSAC de planos, PCA, casco convexo, retângulo mínimo, furos/entalhes), reconstrói cada peça com forma, tamanho, cor, posição e orientação reais. A reconstrução aparece ao vivo por cima da câmera.
 - **Scanner por foto**: foto de frente ou de cima → mesma segmentação e classificação geométrica. Toque para corrigir.
-- **3D**: renderizador OpenGL (z-buffer, antisserrilhado, sombras); toque numa peça para trocar forma, tamanho, cor, orientação, profundidade e altura. Exporta JSON para o simulador MK-7 (`unitMeters` dá a escala).
+- **3D**: renderizador OpenGL (z-buffer, antisserrilhado, sombras); toque numa peça para trocar forma, tamanho, cor, orientação, profundidade e altura. Exporta o **código B8** do Brastoy Simulator (com o inventário junto, se quiser) e JSON; abre qualquer código do simulador (B8, B7…B1 ou JSON) com posição e giro exatos.
+- **Peças (inventário)**: quantas peças de cada um dos 30 tipos do simulador. Conta pela câmera ao vivo (etiqueta em cada peça, número estável) ou por foto com revisão (tocar para corrigir, tirar ou marcar a que faltou); vira um código B8 de poucos caracteres para o simulador.
+
+Os códigos são gerados e lidos pelo **codec do próprio simulador** (`app/src/main/assets/brastoy-codec.js`, extraído do `index.html` por `tools/extrair_codec.py`), rodando num WebView; todo código gerado é decodificado de volta e conferido. `node tools/testar_codec.cjs` roda no CI.
 
 Medidas das peças ficam em `vision/Catalog.kt` (ainda estimadas: 5 / 7,5 / 10 cm). Sem sensor de profundidade o scanner 3D acha as peças, mas a forma fica menos precisa.
 

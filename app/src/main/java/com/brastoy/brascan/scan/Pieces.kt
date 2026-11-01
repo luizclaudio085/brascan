@@ -132,7 +132,8 @@ object Layout {
      * só ela se mexe — é a que o usuário está empurrando.
      */
     fun solve(placed: List<Placed>, selected: Int): List<Placed> {
-        val bodies = placed.map { Collision.Body(it.piece.id, it.piece.shape, it.center, it.u, it.v, it.edge, fixed = selected >= 0 && it.piece.id != selected, size = it.piece.size) }
+        // peça de código do simulador sem edição: o simulador já garantiu que não atravessa nada; fica parada
+        val bodies = placed.map { Collision.Body(it.piece.id, it.piece.shape, it.center, it.u, it.v, it.edge, fixed = if (selected >= 0) it.piece.id != selected else isExact(it.piece), size = it.piece.size) }
         Collision.resolve(bodies, iters = 80)
         return placed.mapIndexed { i, pl -> pl.copy(center = bodies[i].center, pushed = (bodies[i].center - pl.center).len()) }
     }
@@ -145,23 +146,27 @@ object Layout {
     fun exportReady(placed: List<Placed>): List<Placed> {
         val list = placed.toMutableList()
         for ((i, pl) in list.withIndex()) {
-            if (pl.piece.shape != "encaixe") continue
+            if (pl.piece.shape != "encaixe" || isExact(pl.piece)) continue
             val frame = list.firstOrNull { f -> Catalog.holes(f.piece.shape).isNotEmpty() && kotlin.math.abs(f.n.dot(pl.n)) > .9f && (pl.center - f.center).len() < f.edge * .3f } ?: continue
             val up = if (frame.n.y >= 0) frame.n else frame.n * -1f
             list[i] = pl.copy(center = frame.center + up * (Catalog.thickness(frame.piece.size, frame.edge) / 2 + Catalog.thickness(pl.piece.size, pl.edge) / 2 + .01f))
         }
         Collision.allowInserts = false
-        val bodies = list.map { Collision.Body(it.piece.id, it.piece.shape, it.center, it.u, it.v, it.edge, size = it.piece.size, inflate = .012f) }
-        Collision.resolve(bodies, iters = 200, tol = 0f)
+        val bodies = list.map { Collision.Body(it.piece.id, it.piece.shape, it.center, it.u, it.v, it.edge, fixed = isExact(it.piece), size = it.piece.size, inflate = .012f) }
+        if (bodies.any { !it.fixed }) Collision.resolve(bodies, iters = 200, tol = 0f)
         Collision.allowInserts = true
         val out = list.mapIndexed { i, pl -> pl.copy(center = bodies[i].center) }
         // chão: o ponto mais baixo de cada peça fica pelo menos 2/256 acima de zero mesmo depois de arredondar
         return out.map { pl ->
+            if (isExact(pl.piece)) return@map pl
             val t = Catalog.thickness(pl.piece.size, pl.edge)
             val low = Catalog.polygon(pl.piece.shape).minOf { (a, b) -> minOf((pl.center + pl.u * (a * pl.edge) + pl.v * (b * pl.edge) + pl.n * (t / 2)).y, (pl.center + pl.u * (a * pl.edge) + pl.v * (b * pl.edge) - pl.n * (t / 2)).y) }
             if (low < 2f / 256) pl.copy(center = pl.center + V3(0f, 2f / 256 - low, 0f)) else pl
         }
     }
+
+    /** Peça que veio de um código do simulador e não foi mexida: posição e giro exatos, já válidos no simulador. */
+    fun isExact(p: Piece) = p.evidence?.source == Evidence.Source.CODIGO && p.depth == 0f && p.lift == 0f && p.turn == 0 && p.orient == null
 
     /** Quatérnio (x, y, z, w) da base (u, v, n) — mesma convenção do MK-7: identidade = peça em pé de frente. */
     fun quat(u: V3, v: V3, n: V3): List<Double> {

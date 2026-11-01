@@ -17,7 +17,7 @@ data class Evidence(
     val accepted: Boolean = false,
     val view: String = "", // foto: "frente" ou "cima"
 ) {
-    enum class Source(val label: String) { FOTO("foto"), SCANNER("scanner 3D"), EXEMPLO("exemplo"), MANUAL("marcada à mão"), HIPOTESE("hipótese") }
+    enum class Source(val label: String) { FOTO("foto"), SCANNER("scanner 3D"), EXEMPLO("exemplo"), MANUAL("marcada à mão"), HIPOTESE("hipótese"), CODIGO("código do simulador") }
 }
 
 /** Verde: observado e validado · Amarelo: inferido/pouco confiável · Vermelho: conflito · Cinza: desconhecido. */
@@ -55,6 +55,7 @@ object Confidence {
                 }
             }
             Evidence.Source.MANUAL -> { atLeast(Level.AMARELO); why += "Marcada à mão na foto: posição aproximada" }
+            Evidence.Source.CODIGO -> why += "Veio de um código do simulador: posição e giro exatos (nada foi medido pela câmera)"
             Evidence.Source.SCANNER -> {
                 why += "Vista em ${e.views} quadros"
                 if (e.views < 5) { atLeast(Level.AMARELO); why += "Poucas vistas: escaneie mais um pouco em volta" }

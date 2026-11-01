@@ -27,6 +27,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.CameraAlt
 import androidx.compose.material.icons.rounded.Explore
+import androidx.compose.material.icons.rounded.Inventory2
 import androidx.compose.material.icons.rounded.SystemUpdate
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.ViewInAr
@@ -85,7 +86,8 @@ class MainActivity : ComponentActivity() {
 }
 
 private enum class Tab(val label: String, val icon: androidx.compose.ui.graphics.vector.ImageVector) {
-    CAMPO("Campo", Icons.Rounded.Explore), SCAN("Scanner", Icons.Rounded.CameraAlt), MODELO("3D", Icons.Rounded.ViewInAr), AJUSTES("Ajustes", Icons.Rounded.Tune)
+    CAMPO("Campo", Icons.Rounded.Explore), SCAN("Scanner", Icons.Rounded.CameraAlt), MODELO("3D", Icons.Rounded.ViewInAr),
+    PECAS("Peças", Icons.Rounded.Inventory2), AJUSTES("Ajustes", Icons.Rounded.Tune)
 }
 
 @Composable
@@ -98,6 +100,8 @@ private fun App() {
     var arOpen by rememberSaveable { mutableStateOf(false) }
     var markerOpen by rememberSaveable { mutableStateOf(false) }
     var resumeMap by remember { mutableStateOf<String?>(null) }
+    var countOpen by rememberSaveable { mutableStateOf(false) }
+    var countShot by remember { mutableStateOf<com.brastoy.brascan.ui.CountShot?>(null) }
     // projeto atual: volta sozinho depois de uma interrupção e é salvo a cada mudança
     val store = remember { com.brastoy.brascan.scan.ProjectStore(ctx) }
     LaunchedEffect(Unit) { store.load("atual")?.let { scan.load(it, it.pid.ifBlank { scan.projectId }) } }
@@ -116,6 +120,18 @@ private fun App() {
         }
     }
 
+    if (countOpen) {
+        androidx.activity.compose.BackHandler { countOpen = false }
+        com.brastoy.brascan.ui.CountCameraScreen(onClose = { countOpen = false },
+            onAdd = { add ->
+                val inv = com.brastoy.brascan.scan.Inventory.load(ctx).plus(add)
+                com.brastoy.brascan.scan.Inventory.save(ctx, inv)
+                com.brastoy.brascan.ui.toast(ctx, "${add.values.sum()} peças somadas (inventário: ${inv.total()})")
+                countOpen = false; tab = Tab.PECAS
+            },
+            onFreeze = { s -> countShot = s; countOpen = false; tab = Tab.PECAS })
+        return
+    }
     if (markerOpen) {
         androidx.activity.compose.BackHandler { markerOpen = false }
         com.brastoy.brascan.ar.MarkerScanScreen(initialMap = resumeMap, onClose = { markerOpen = false }, onDone = { found, map -> scan.importScan(found, map); markerOpen = false; tab = Tab.MODELO })
@@ -146,6 +162,7 @@ private fun App() {
                     Tab.CAMPO -> FieldScreen(field, hasSensor)
                     Tab.SCAN -> ScanScreen(scan, openAr = { resumeMap = null; markerOpen = true }, openArCore = { arOpen = true }, openResume = { resumeMap = scan.slamMap; markerOpen = true }) { tab = Tab.MODELO }
                     Tab.MODELO -> ModelScreen(scan)
+                    Tab.PECAS -> com.brastoy.brascan.ui.InventoryScreen(countShot, onShot = { countShot = it }, openCamera = { countOpen = true })
                     Tab.AJUSTES -> Settings(update)
                 }
             }

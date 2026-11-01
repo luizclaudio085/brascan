@@ -136,6 +136,13 @@ class ScanState {
     var projectId by mutableStateOf(com.brastoy.brascan.scan.ProjectStore.newId())
     var projectName by mutableStateOf("Sem nome")
 
+    /** Substitui as peças pela construção de um código do simulador (B8…B1 ou JSON): posição e giro exatos. */
+    fun importCode(items: List<com.brastoy.brascan.scan.SimCodec.Item>) {
+        image = null; selected = -1; pieces.clear(); slamMap = null
+        val list = com.brastoy.brascan.scan.SimCodec.pieces(items, nextId)
+        nextId += list.size; pieces.addAll(list)
+    }
+
     /** Substitui as peças pelas reconstruídas no scanner 3D (pose real, sem foto). */
     fun importScan(found: List<com.brastoy.brascan.vision.Piece3D>, map: String? = null) {
         image = null; selected = -1; pieces.clear()
@@ -184,7 +191,11 @@ class ScanState {
     /** Toda edição feita pelo usuário conta como confirmação da peça. */
     fun update(id: Int, f: (Piece) -> Piece) {
         val i = pieces.indexOfFirst { it.id == id }; if (i < 0) return
-        val np = f(pieces[i]); pieces[i] = np.copy(evidence = (np.evidence ?: com.brastoy.brascan.vision.Evidence(com.brastoy.brascan.vision.Evidence.Source.MANUAL)).copy(accepted = true))
+        val old = pieces[i]; val np = f(old)
+        val ev = np.evidence ?: com.brastoy.brascan.vision.Evidence(com.brastoy.brascan.vision.Evidence.Source.MANUAL)
+        // trocar formato/tamanho de uma peça do código pode criar sobreposição: deixa de ser "exata" (a colisão volta a agir)
+        val src = if (ev.source == com.brastoy.brascan.vision.Evidence.Source.CODIGO && (np.shape != old.shape || np.size != old.size)) com.brastoy.brascan.vision.Evidence.Source.MANUAL else ev.source
+        pieces[i] = np.copy(evidence = ev.copy(source = src, accepted = true))
     }
 }
 
@@ -200,7 +211,7 @@ fun ScanScreen(st: ScanState, openAr: () -> Unit, openArCore: () -> Unit, openRe
     pendingLoad?.let { uri ->
         androidx.compose.runtime.LaunchedEffect(uri) {
             st.busy = true
-            val bmp = withContext(Dispatchers.IO) { runCatching { decode(ctx, uri) }.getOrNull() }
+            val bmp = withContext(Dispatchers.IO) { runCatching { decodeBitmap(ctx, uri) }.getOrNull() }
             if (bmp == null) toast(ctx, "Não consegui abrir a imagem") else {
                 st.image = bmp; st.pieces.clear(); st.selected = -1
                 val found = withContext(Dispatchers.Default) { Detector.detect(bmp, st.newId()) }
@@ -483,6 +494,9 @@ private fun ExportPanel(st: ScanState, demo: Boolean) {
     val scope = androidx.compose.runtime.rememberCoroutineScope()
     var b5 by remember { mutableStateOf<String?>(null) }
     var experimental by remember { mutableStateOf(false) }
+    var inventory by remember { mutableStateOf(com.brastoy.brascan.scan.Inventory.load(ctx)) }
+    var withInventory by remember { mutableStateOf(false) }
+    var pasteOpen by remember { mutableStateOf(false) }
     val hasHyp = st.pieces.any { it.evidence?.source == Evidence.Source.HIPOTESE }
     // conservador: só o que foi visto/confirmado; experimental: inclui hipóteses que você aceitou
     fun exported() = st.placed().filter { experimental || it.piece.evidence?.source != Evidence.Source.HIPOTESE }
@@ -490,26 +504,66 @@ private fun ExportPanel(st: ScanState, demo: Boolean) {
         Text(if (experimental) "Exportar com hipóteses aceitas (experimental)" else "Exportar só o que foi visto (conservador)", color = Color.White, fontSize = 13.sp, modifier = Modifier.weight(1f))
         androidx.compose.material3.Switch(checked = experimental, onCheckedChange = { experimental = it })
     }
+    if (inventory.total() > 0) Row(verticalAlignment = Alignment.CenterVertically) {
+        Text("Levar junto o inventário (${inventory.total()} peças)", color = Color.White, fontSize = 13.sp, modifier = Modifier.weight(1f))
+        androidx.compose.material3.Switch(checked = withInventory, onCheckedChange = { withInventory = it })
+    }
     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         Button(enabled = !demo && b5 != "…", onClick = {
             b5 = "…"
             scope.launch {
-                when (val r = com.brastoy.brascan.scan.B5Export.encode(ctx, exported())) {
-                    is com.brastoy.brascan.scan.B5Export.Result.Ok -> {
+                when (val r = com.brastoy.brascan.scan.SimCodec.encodeModel(ctx, exported(), inventory.takeIf { withInventory })) {
+                    is com.brastoy.brascan.scan.SimCodec.Result.Ok -> {
                         (ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Brastoy", r.code))
-                        b5 = "Copiado e conferido (reimportado sem diferença, erro máx. ${"%.1f".format(r.maxPosError * 75)} mm): ${r.pieces} peças\n${r.code}"
+                        b5 = "B8 copiado e conferido (reimportado sem diferença, erro máx. ${"%.1f".format(r.maxPosError * 75)} mm): ${r.pieces} peças${if (withInventory) " + inventário" else ""}, ${r.code.codePointCount(0, r.code.length)} caracteres\n${r.code}"
                     }
-                    is com.brastoy.brascan.scan.B5Export.Result.Failed -> b5 = "Não exportei: ${r.message}"
+                    is com.brastoy.brascan.scan.SimCodec.Result.Failed -> b5 = "Não exportei: ${r.message}"
                 }
             }
-        }, modifier = Modifier.weight(1f)) { Icon(Icons.Rounded.ContentCopy, null); Spacer(Modifier.width(6.dp)); Text("Código B4/B5") }
+        }, modifier = Modifier.weight(1f)) { Icon(Icons.Rounded.ContentCopy, null); Spacer(Modifier.width(6.dp)); Text("Código B8") }
         FilledTonalButton(enabled = !demo, onClick = {
             ctx.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("application/json").putExtra(Intent.EXTRA_TEXT, Layout.json(Layout.exportReady(exported()))), "Enviar para o simulador"))
         }, modifier = Modifier.weight(1f)) { Icon(Icons.Rounded.Share, null); Spacer(Modifier.width(6.dp)); Text("JSON") }
     }
     b5?.takeIf { it != "…" }?.let { Text(it, color = if (it.startsWith("Não")) Palette.pink else Palette.y, fontSize = 12.sp, maxLines = 6, modifier = Modifier.padding(top = 8.dp)) }
+    OutlinedButton(onClick = { pasteOpen = true }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) { Text("Abrir código do simulador (B8, B7…, JSON)") }
+    if (pasteOpen) PasteCodeDialog(onDismiss = { pasteOpen = false }) { d ->
+        pasteOpen = false
+        if (d.items.isNotEmpty()) { st.importCode(d.items); toast(ctx, "${d.items.size} peças do código no 3D") }
+        d.inventory?.let { com.brastoy.brascan.scan.Inventory.save(ctx, it); inventory = it; toast(ctx, "Inventário do código salvo (${it.total()} peças)") }
+        if (d.items.isEmpty() && d.inventory == null) toast(ctx, "O código não tem construção nem inventário")
+    }
     ProjectsRow(st)
     Text("Arraste: girar · pinça: zoom · toque duplo: recentralizar", color = Palette.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
+}
+
+/** Colar um código do simulador (lê o da área de transferência se houver); decodifica pelo codec do próprio simulador. */
+@Composable
+internal fun PasteCodeDialog(onDismiss: () -> Unit, onDecoded: (com.brastoy.brascan.scan.SimCodec.Decoded) -> Unit) {
+    val ctx = LocalContext.current
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    val clip = remember { runCatching { (ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).primaryClip?.getItemAt(0)?.coerceToText(ctx)?.toString() }.getOrNull().orEmpty() }
+    var text by remember { mutableStateOf(clip.takeIf { it.trim().let { t -> t.startsWith("8") || t.startsWith("7") || t.startsWith("B") || t.startsWith("{") } } ?: "") }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    androidx.compose.material3.AlertDialog(onDismissRequest = onDismiss,
+        title = { Text("Abrir código do simulador") },
+        text = {
+            Column {
+                androidx.compose.material3.OutlinedTextField(value = text, onValueChange = { text = it; error = null }, label = { Text("Código (B8 começa com 8)") }, maxLines = 4, modifier = Modifier.fillMaxWidth())
+                error?.let { Text(it, color = Palette.pink, fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp)) }
+                Text("Construção vai para o 3D; inventário vai para a aba Peças.", color = Palette.muted, fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp))
+            }
+        },
+        confirmButton = { Button(enabled = text.isNotBlank() && !busy, onClick = {
+            busy = true
+            scope.launch {
+                val (d, err) = com.brastoy.brascan.scan.SimCodec.decode(ctx, text)
+                busy = false
+                if (d != null) onDecoded(d) else error = "Não consegui ler: $err"
+            }
+        }) { Text(if (busy) "Lendo…" else "Abrir") } },
+        dismissButton = { OutlinedButton(onClick = onDismiss) { Text("Cancelar") } })
 }
 
 /** Projeto: nome, salvar com nome, abrir/apagar salvos, começar um novo. O atual é salvo sozinho. */
@@ -650,8 +704,7 @@ private fun demoModel(): List<Placed> {
     )
 }
 
-private fun decode(ctx: Context, uri: Uri): Bitmap {
-    val max = 1400
+internal fun decodeBitmap(ctx: Context, uri: Uri, max: Int = 1400): Bitmap {
     return if (Build.VERSION.SDK_INT >= 28) {
         // ImageDecoder já aplica a rotação EXIF das fotos da câmera.
         ImageDecoder.decodeBitmap(ImageDecoder.createSource(ctx.contentResolver, uri)) { d, info, _ ->
