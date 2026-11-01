@@ -216,30 +216,11 @@ class ArScanView(ctx: Context, private val session: Session, private val onStatu
          * correspondente) em vez de pegar um pixel só: menos ruído e serrilhado, que os testes nunca viam.
          */
         fun yuvToArgb(img: Image, outW: Int): Triple<IntArray, Int, Int> {
-            val w = img.width; val h = img.height; val oh = h * outW / w
             val yp = img.planes[0]; val up = img.planes[1]; val vp = img.planes[2]
-            val yb: ByteBuffer = yp.buffer; val ub = up.buffer; val vb = vp.buffer
-            val out = IntArray(outW * oh)
-            val bx = (w / outW).coerceIn(1, 4); val by = (h / oh).coerceIn(1, 4) // tamanho do bloco de média
-            for (oy in 0 until oh) {
-                val sy = oy * h / oh
-                for (ox in 0 until outW) {
-                    val sx = ox * w / outW
-                    var ys = 0; var n = 0
-                    for (dy in 0 until by) { val row = (sy + dy).coerceAtMost(h - 1) * yp.rowStride; for (dx in 0 until bx) { ys += yb.get(row + (sx + dx).coerceAtMost(w - 1) * yp.pixelStride).toInt() and 255; n++ } }
-                    val yy = ys.toFloat() / n
-                    var us = 0; var vs = 0; var nc = 0
-                    for (dy in 0 until by step 2) { val row = ((sy + dy) / 2).coerceAtMost(h / 2 - 1); for (dx in 0 until bx step 2) { val col = ((sx + dx) / 2).coerceAtMost(w / 2 - 1)
-                        us += ub.get(row * up.rowStride + col * up.pixelStride).toInt() and 255; vs += vb.get(row * vp.rowStride + col * vp.pixelStride).toInt() and 255; nc++ } }
-                    val u = us.toFloat() / nc - 128f
-                    val v = vs.toFloat() / nc - 128f
-                    val r = (yy + 1.402f * v).toInt().coerceIn(0, 255)
-                    val g = (yy - .344f * u - .714f * v).toInt().coerceIn(0, 255)
-                    val b = (yy + 1.772f * u).toInt().coerceIn(0, 255)
-                    out[oy * outW + ox] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-                }
-            }
-            return Triple(out, outW, oh)
+            // planos copiados em bloco para arrays (get(i) pixel a pixel no ByteBuffer custava ~150-220 ms por quadro no
+            // emulador); mesma conta, resultado idêntico (YuvTest)
+            return com.brastoy.brascan.vision.Yuv.toArgb(yp.buffer, yp.rowStride, yp.pixelStride, up.buffer, up.rowStride, up.pixelStride,
+                vp.buffer, vp.rowStride, vp.pixelStride, img.width, img.height, outW)
         }
     }
 }
