@@ -81,6 +81,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        Updater.init(applicationContext)
         setContent { BraScanTheme { App() } }
     }
 }
@@ -117,13 +118,19 @@ private fun App() {
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     LaunchedEffect(Unit) {
         lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
-            while (true) { Updater.tick(ctx); delay(30_000) }
+            while (true) { Updater.check(ctx); delay(30_000) }
         }
     }
-    // versão nova já baixada instala quando o usuário sai do app (instalar fecha o app: não interrompe o uso)
-    androidx.compose.runtime.DisposableEffect(lifecycle) {
-        val obs = androidx.lifecycle.LifecycleEventObserver { _, e -> if (e == Lifecycle.Event.ON_STOP) Updater.onBackground(ctx) }
-        lifecycle.addObserver(obs); onDispose { lifecycle.removeObserver(obs) }
+    // instalar mata o processo: o projeto atual é salvo na hora, antes (o salvamento normal espera 800 ms)
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        Updater.beforeInstall = { runCatching { store.save("atual", scan.toProject()) } }
+        onDispose { Updater.beforeInstall = null }
+    }
+    // telas que não podem ser interrompidas pela instalação (câmera ao vivo, lote em revisão)
+    val busy = markerOpen || arOpen || countOpen || countShot != null
+    androidx.compose.runtime.DisposableEffect(busy) {
+        if (busy) Updater.setBusy(true)
+        onDispose { if (busy) Updater.setBusy(false) }
     }
     // o sistema pediu confirmação logo depois de um toque em "Atualizar": abre a tela "Instalar?" daqui (na frente)
     LaunchedEffect(update) {
@@ -206,6 +213,7 @@ private fun UpdateBanner(s: Updater.State) {
     val scope = rememberCoroutineScope()
     val visible = s is Updater.State.Available || s is Updater.State.Downloading || s is Updater.State.NeedsPermission || s is Updater.State.Installing ||
         s is Updater.State.Ready || s is Updater.State.NeedsConfirm || (s is Updater.State.Failed && s.remote != null)
+    val activity = ctx as? android.app.Activity
     AnimatedVisibility(visible) {
         GlassCard(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -218,7 +226,7 @@ private fun UpdateBanner(s: Updater.State) {
                         is Updater.State.Installing -> "Instalando ${s.remote.name}…"
                         is Updater.State.Ready -> "Versão ${s.remote.name} pronta"
                         is Updater.State.NeedsConfirm -> "Confirme a atualização para ${s.remote.name}"
-                        is Updater.State.Failed -> "Versão ${s.remote?.name} não instalou"
+                        is Updater.State.Failed -> "Versão ${s.remote?.name} ${if (s.download) "não baixou" else "não instalou"}"
                         else -> ""
                     }, color = Color.White, fontWeight = FontWeight.SemiBold)
                     if (s is Updater.State.NeedsPermission) Text("Só precisa fazer uma vez", color = Palette.muted, fontSize = 12.sp)
@@ -227,15 +235,19 @@ private fun UpdateBanner(s: Updater.State) {
                     if (s is Updater.State.Failed) Text(s.message, color = Palette.muted, fontSize = 12.sp)
                 }
                 when (s) {
-                    is Updater.State.Available -> Button(onClick = { scope.launch { Updater.installNow(ctx) } }) { Text("Atualizar") }
-                    is Updater.State.Ready -> Button(onClick = { scope.launch { Updater.installNow(ctx) } }) { Text(if (s.silent) "Instalar agora" else "Instalar") }
-                    is Updater.State.NeedsConfirm -> Button(onClick = { (ctx as? android.app.Activity)?.let { Updater.openConfirm(it) } }) { Text("Instalar") }
-                    is Updater.State.NeedsPermission -> Button(onClick = { ctx.startActivity(Updater.permissionIntent(ctx)) }) { Text("Liberar") }
-                    is Updater.State.Failed -> Button(onClick = { scope.launch { Updater.installNow(ctx) } }) { Text("Tentar de novo") }
+                    is Updater.State.Available -> Button(onClick = { Updater.install(ctx) }) { Text("Atualizar") }
+                    is Updater.State.Ready -> Button(onClick = { Updater.install(ctx) }) { Text(if (s.silent) "Instalar agora" else "Instalar") }
+                    is Updater.State.NeedsConfirm -> Button(onClick = { activity?.let { Updater.openConfirm(it) } }) { Text("Instalar") }
+                    is Updater.State.NeedsPermission -> Button(onClick = { Updater.externalFlow(); runCatching { ctx.startActivity(Updater.permissionIntent(ctx)) } }) { Text("Liberar") }
+                    is Updater.State.Failed -> Button(onClick = { Updater.install(ctx) }) { Text("Tentar de novo") }
                     else -> Unit
                 }
             }
             if (s is Updater.State.Downloading) LinearProgressIndicator(progress = { s.progress }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp))
+            // a sessão foi recusada (alguns Xiaomi e afins): o instalador do próprio Android abre o APK já baixado
+            if (s is Updater.State.Failed && s.fallback && s.remote != null && activity != null) androidx.compose.material3.TextButton(
+                onClick = { if (!Updater.installWithSystem(activity, s.remote)) Updater.install(ctx) }, modifier = Modifier.fillMaxWidth(),
+            ) { Text("Instalar pelo instalador do Android", color = Palette.accent) }
         }
     }
 }
@@ -271,8 +283,8 @@ private fun Settings(update: Updater.State) {
                 Switch(checked = auto, onCheckedChange = { auto = it; Updater.setAutoInstall(ctx, it) })
             }
             Row(Modifier.padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Button(onClick = { scope.launch { Updater.tick(ctx, force = true) } }, modifier = Modifier.weight(1f)) { Text("Verificar agora") }
-                OutlinedButton(onClick = { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(Updater.releasesPage()))) }, modifier = Modifier.weight(1f)) { Text("Ver no GitHub") }
+                Button(onClick = { Updater.check(ctx, force = true) }, modifier = Modifier.weight(1f)) { Text("Verificar agora") }
+                OutlinedButton(onClick = { Updater.externalFlow(); runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(Updater.releasesPage()))) } }, modifier = Modifier.weight(1f)) { Text("Ver no GitHub") }
             }
         }
         GlassCard(Modifier.fillMaxWidth()) {

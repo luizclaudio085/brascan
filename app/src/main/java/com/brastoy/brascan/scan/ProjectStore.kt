@@ -29,9 +29,17 @@ class ProjectStore(ctx: Context) {
             .put("pid", p.pid).put("rejected", JSONArray(p.rejected)).put("vista", p.vista.name).put("pieces", JSONArray(p.pieces.map(::pieceJson)))
         p.slamMap?.let { j.put("slamMap", it) }
         val photoFile = File(dir, "$id.jpg")
-        if (p.photo != null) { photoFile.outputStream().use { p.photo.compress(Bitmap.CompressFormat.JPEG, 88, it) }; j.put("photo", photoFile.name) } else photoFile.delete()
-        // grava num temporário e troca: um desligamento no meio não corrompe o projeto
-        val tmp = File(dir, "$id.json.tmp"); tmp.writeText(j.toString()); tmp.renameTo(File(dir, "$id.json").also { it.delete() })
+        // tudo é gravado num temporário e trocado de uma vez (rename substitui atomicamente no Android): o processo morrer
+        // no meio (ex.: atualização instalando) não deixa foto truncada nem projeto sem .json
+        if (p.photo != null) {
+            val tmpPhoto = File(dir, "$id.jpg.tmp")
+            tmpPhoto.outputStream().use { p.photo.compress(Bitmap.CompressFormat.JPEG, 88, it) }
+            if (!tmpPhoto.renameTo(photoFile)) { photoFile.delete(); tmpPhoto.renameTo(photoFile) }
+            j.put("photo", photoFile.name)
+        } else photoFile.delete()
+        val tmp = File(dir, "$id.json.tmp"); tmp.writeText(j.toString())
+        val dst = File(dir, "$id.json")
+        if (!tmp.renameTo(dst)) { dst.delete(); tmp.renameTo(dst) }
     }
 
     fun load(id: String): Project? = runCatching {

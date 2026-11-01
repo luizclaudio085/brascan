@@ -149,9 +149,10 @@ fun InventoryScreen(shot: CountShot?, onShot: (CountShot?) -> Unit, openCamera: 
                 FilledTonalButton(enabled = !busy, onClick = {
                     val dir = File(ctx.cacheDir, "photos").apply { mkdirs() }
                     photoUri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.files", File(dir, "lote_${System.currentTimeMillis()}.jpg"))
+                    com.brastoy.brascan.update.Updater.externalFlow()
                     runCatching { shoot.launch(photoUri!!) }.onFailure { toast(ctx, "Câmera indisponível") }
                 }, modifier = Modifier.weight(1f)) { Icon(Icons.Rounded.PhotoCamera, null); Spacer(Modifier.width(6.dp)); Text("Foto do lote") }
-                FilledTonalButton(enabled = !busy, onClick = { pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }, modifier = Modifier.weight(1f)) {
+                FilledTonalButton(enabled = !busy, onClick = { com.brastoy.brascan.update.Updater.externalFlow(); pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }, modifier = Modifier.weight(1f)) {
                     Icon(Icons.Rounded.PhotoLibrary, null); Spacer(Modifier.width(6.dp)); Text("Galeria")
                 }
             }

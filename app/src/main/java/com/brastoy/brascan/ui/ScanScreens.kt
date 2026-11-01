@@ -257,9 +257,10 @@ fun ScanScreen(st: ScanState, openAr: () -> Unit, openArCore: () -> Unit, openRe
                     val dir = File(ctx.cacheDir, "photos").apply { mkdirs() }
                     val f = File(dir, "brascan_${System.currentTimeMillis()}.jpg")
                     photoUri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.files", f)
+                    com.brastoy.brascan.update.Updater.externalFlow()
                     runCatching { shoot.launch(photoUri!!) }.onFailure { toast(ctx, "Câmera indisponível") }
                 }, Modifier.weight(1f).height(52.dp)) { Icon(Icons.Rounded.PhotoCamera, null); Spacer(Modifier.width(8.dp)); Text("Câmera") }
-                FilledTonalButton(onClick = { pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }, Modifier.weight(1f).height(52.dp)) {
+                FilledTonalButton(onClick = { com.brastoy.brascan.update.Updater.externalFlow(); pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }, Modifier.weight(1f).height(52.dp)) {
                     Icon(Icons.Rounded.PhotoLibrary, null); Spacer(Modifier.width(8.dp)); Text("Galeria")
                 }
             }
@@ -522,6 +523,7 @@ private fun ExportPanel(st: ScanState, demo: Boolean) {
             }
         }, modifier = Modifier.weight(1f)) { Icon(Icons.Rounded.ContentCopy, null); Spacer(Modifier.width(6.dp)); Text("Código B8") }
         FilledTonalButton(enabled = !demo, onClick = {
+            com.brastoy.brascan.update.Updater.externalFlow()
             ctx.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("application/json").putExtra(Intent.EXTRA_TEXT, Layout.json(Layout.exportReady(exported()))), "Enviar para o simulador"))
         }, modifier = Modifier.weight(1f)) { Icon(Icons.Rounded.Share, null); Spacer(Modifier.width(6.dp)); Text("JSON") }
     }

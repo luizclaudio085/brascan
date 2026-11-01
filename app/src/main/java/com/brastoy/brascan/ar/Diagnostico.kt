@@ -72,6 +72,7 @@ class Diagnostico(private val ctx: Context) {
             val uri = FileProvider.getUriForFile(ctx, ctx.packageName + ".files", zip)
             val send = Intent(Intent.ACTION_SEND).setType("application/zip").putExtra(Intent.EXTRA_STREAM, uri).putExtra(Intent.EXTRA_SUBJECT, "BraScan diagnóstico " + zip.name)
                 .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            com.brastoy.brascan.update.Updater.externalFlow()
             ctx.startActivity(Intent.createChooser(send, "Enviar diagnóstico").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         }
     }
