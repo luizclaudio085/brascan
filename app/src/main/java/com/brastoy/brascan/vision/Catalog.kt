@@ -2,8 +2,9 @@ package com.brastoy.brascan.vision
 
 /**
  * Catálogo das peças Brastoy — mesmos nomes e polígonos do simulador MK (index.html: vertices/tileShape).
- * Unidade = lado do quadrado grande. Proporções conferidas nas fotos reais (out/2026):
- * médio/grande = 0,81 (quadrado laranja × rosa); retângulo = 1 × 0,5; isósceles com altura 1,85; encaixe ≈ 0,83.
+ * Unidade = lado da peça (o tamanho entra por [SCALE]). Proporções conferidas nas fotos reais (out/2026) e levadas
+ * para o simulador: médio/grande = 0,81 (quadrado laranja × rosa); retângulo = 1 × 0,5; isósceles com altura 1,85;
+ * encaixe com lado 0,83 do GRANDE; porta com vão em arco centrado; janela de 4 vidros; moldura com vão octogonal.
  */
 object Catalog {
     val SHAPES = listOf("quadrado", "retangulo", "equilatero", "retanguloTri", "isoceles", "moldura", "janela", "porta", "L", "E", "encaixe")
@@ -19,6 +20,9 @@ object Catalog {
     val SCALE = mapOf("grande" to 1f, "medio" to .81f, "pequeno" to .5f)
     /** Espessura em lados do quadrado GRANDE, igual para todos os tamanhos (como no simulador: thickness=.065). */
     const val THICKNESS = .065f
+    /** Encaixe plástico: lado 0,83 do grande; só existe no médio, então o polígono vem em lados do médio. */
+    const val ENCAIXE_SIDE = .83f
+    private val ENCAIXE_HALF = ENCAIXE_SIDE / 2 / SCALE.getValue("medio")
 
     /** Espessura na unidade em que [edge] (lado desta peça) está medido. */
     fun thickness(size: String, edge: Float) = THICKNESS * edge / SCALE.getValue(size)
@@ -46,17 +50,24 @@ object Catalog {
         "L" -> listOf(-.5f to -.5f, .5f to -.5f, .5f to -.15f, -.15f to -.15f, -.15f to .5f, -.5f to .5f)
         "E" -> listOf(-.25f to -.5f, .25f to -.5f, .25f to -.4f, -.10f to -.4f, -.10f to -.2f, .25f to -.2f, .25f to -.1f, -.10f to -.1f,
             -.10f to .1f, .25f to .1f, .25f to .2f, -.10f to .2f, -.10f to .4f, .25f to .4f, .25f to .5f, -.25f to .5f)
-        "encaixe" -> listOf(-.415f to -.415f, .415f to -.415f, .415f to .415f, -.415f to .415f)
+        "encaixe" -> listOf(-ENCAIXE_HALF to -ENCAIXE_HALF, ENCAIXE_HALF to -ENCAIXE_HALF, ENCAIXE_HALF to ENCAIXE_HALF, -ENCAIXE_HALF to ENCAIXE_HALF)
         else -> listOf(-.5f to -.5f, .5f to -.5f, .5f to .5f, -.5f to .5f)
     }
 
-    /** Furos (em lados). Janela: 4 vidros dentro do vão da moldura. */
+    /**
+     * Furos (em lados), iguais a holes() do simulador. Moldura: octógono regular de 0,64; janela: 4 vidros de
+     * 0,275 com cruz de 0,11; porta: vão de 0,52 centrado com topo em semicírculo (12 segmentos, como no simulador).
+     */
     fun holes(shape: String): List<List<Pair<Float, Float>>> {
         fun rect(x0: Float, y0: Float, x1: Float, y1: Float) = listOf(x0 to y0, x1 to y0, x1 to y1, x0 to y1)
         return when (shape) {
-            "moldura" -> listOf(rect(-.30f, -.30f, .30f, .30f))
-            "janela" -> listOf(rect(-.30f, -.30f, -.03f, -.03f), rect(.03f, -.30f, .30f, -.03f), rect(-.30f, .03f, -.03f, .30f), rect(.03f, .03f, .30f, .30f))
-            "porta" -> listOf(rect(-.20f, -.48f, .20f, .30f))
+            "moldura" -> { val a = .32f; val b = .1325f; listOf(listOf(-b to -a, b to -a, a to -b, a to b, b to a, -b to a, -a to b, -a to -b)) }
+            "janela" -> listOf(rect(-.33f, -.33f, -.055f, -.055f), rect(.055f, -.33f, .33f, -.055f), rect(-.33f, .055f, -.055f, .33f), rect(.055f, .055f, .33f, .33f))
+            "porta" -> {
+                val r = .26f; val cy = .11f
+                val arc = (0..12).map { i -> val t = Math.PI * i / 12; (r * kotlin.math.cos(t)).toFloat() to (cy + r * kotlin.math.sin(t)).toFloat() }
+                listOf(listOf(-r to -.36f, r to -.36f) + arc)
+            }
             else -> emptyList()
         }
     }
@@ -75,33 +86,31 @@ object Catalog {
         return (maxOf(w, h) / long + minOf(w, h) / short) / 2
     }
 
-    private fun inPoly(p: List<Pair<Float, Float>>, x: Float, y: Float): Boolean {
-        var c = false; var j = p.size - 1
-        for (i in p.indices) { val (xi, yi) = p[i]; val (xj, yj) = p[j]; if ((yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) c = !c; j = i }
-        return c
-    }
-
     /** Peça sem furo e convexa? (triângulos, quadrado, retângulo, encaixe) */
     fun convex(shape: String) = shape !in setOf("L", "E", "moldura", "janela", "porta")
 
     /**
-     * Peça dividida em partes convexas (em lados): convexas ficam inteiras; L, E e as com furo viram
-     * retângulos de uma grade nas linhas do contorno e dos furos (todas são retilíneas).
+     * Peça dividida em partes convexas (em lados): convexas ficam inteiras; L, E e as com furo viram faixas
+     * horizontais entre os vértices consecutivos em y. Dentro de uma faixa nenhuma aresta dobra, então cada trecho
+     * cheio (entre duas arestas que a atravessam) é um trapézio convexo; vale para lados inclinados e arcos.
      */
     fun convexParts(shape: String): List<List<Pair<Float, Float>>> {
         val poly = polygon(shape)
         if (convex(shape)) return listOf(poly)
-        val hs = holes(shape)
-        val xs = (poly.map { it.first } + hs.flatMap { h -> h.map { it.first } }).distinct().sorted()
-        val ys = (poly.map { it.second } + hs.flatMap { h -> h.map { it.second } }).distinct().sorted()
-        fun solid(x: Float, y: Float) = inPoly(poly, x, y) && hs.none { inPoly(it, x, y) }
+        val loops = listOf(poly) + holes(shape)
+        val edges = loops.flatMap { l -> l.indices.map { l[it] to l[(it + 1) % l.size] } }.filter { (p, q) -> p.second != q.second }
+        val ys = loops.flatten().map { it.second }.distinct().sorted()
+        fun xAt(e: Pair<Pair<Float, Float>, Pair<Float, Float>>, y: Float): Float {
+            val (p, q) = e; return p.first + (q.first - p.first) * (y - p.second) / (q.second - p.second)
+        }
         val out = ArrayList<List<Pair<Float, Float>>>()
         for (j in 0 until ys.size - 1) {
-            var start = -1
-            for (i in 0..xs.size - 1) {
-                val ok = i < xs.size - 1 && solid((xs[i] + xs[i + 1]) / 2, (ys[j] + ys[j + 1]) / 2)
-                if (ok && start < 0) start = i
-                if (!ok && start >= 0) { out += listOf(xs[start] to ys[j], xs[i] to ys[j], xs[i] to ys[j + 1], xs[start] to ys[j + 1]); start = -1 }
+            val y0 = ys[j]; val y1 = ys[j + 1]; val ym = (y0 + y1) / 2
+            val cross = edges.filter { (p, q) -> minOf(p.second, q.second) < ym && maxOf(p.second, q.second) > ym }.sortedBy { xAt(it, ym) }
+            for (k in 0 until cross.size - 1 step 2) {
+                val a = cross[k]; val b = cross[k + 1]
+                val quad = listOf(xAt(a, y0) to y0, xAt(b, y0) to y0, xAt(b, y1) to y1, xAt(a, y1) to y1)
+                out += quad.filterIndexed { i, p -> val n = quad[(i + 1) % 4]; kotlin.math.abs(p.first - n.first) > 1e-6f || p.second != n.second }
             }
         }
         return out

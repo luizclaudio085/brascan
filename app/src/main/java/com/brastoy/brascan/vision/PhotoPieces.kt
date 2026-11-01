@@ -40,7 +40,7 @@ object PhotoPieces {
             val s = shape.getValue(b.id)
             // pontas de triângulo perdem proporcionalmente mais pixels (borda + ímãs); 1,1 calibrado nas fotos reais
             val tri = s == "equilatero" || s == "retanguloTri" || s == "isoceles"
-            return if (s == "encaixe") maxOf(f.obb.w, f.obb.h) / .83f else Catalog.sideFromBox(s, f.obb.w, f.obb.h) * (if (tri) 1.1f else 1f)
+            return Catalog.sideFromBox(s, f.obb.w, f.obb.h) * (if (tri) 1.1f else 1f)
         }
         // o lado do quadrado grande = percentil 75 dos lados (a maioria das peças é grande)
         val sides = kept.filter { shape[it.id] != "encaixe" }.map(::side).sorted()
